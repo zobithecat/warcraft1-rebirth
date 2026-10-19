@@ -1,6 +1,7 @@
 # Native arm64 build of the lifted code and the intro-frame viewer.
 #
-#   make            build/blitview (+ the lifted C it links)
+#   make play       build and run the game (build/war)
+#   make            build/war and build/blitview
 #   make frames     work/demo/intro.wcf from captures in work/frames
 #   make check      decode every frame natively and verify against DOSBox-X
 #   make run        open the viewer window
@@ -20,9 +21,35 @@ WAREXE  := work/exe/war.exe
 LIFTED  := build/lifted_rt.c
 FRAMES  := work/demo/intro.wcf
 
-.PHONY: all frames check run clean
+.PHONY: all frames check run clean war play
 
-all: build/blitview
+all: build/blitview build/war
+
+# ---- the game: whole program lifted to C + native DOS/DPMI/VGA runtime ----
+GAME_C  := build/game.c
+IMAGE   := build/image.bin
+GAME_CFLAGS ?= -O2 -arch arm64 -Wall -Wextra -Wno-unused-parameter $(GAME_DEFS)
+
+$(GAME_C): $(WAREXE) tools/lift.py tools/disasm.py tools/le.py
+	@mkdir -p build
+	$(PYTHON) tools/lift.py $@ --all
+
+build/game.o: $(GAME_C) runtime/x86.h
+	$(CC) $(GAME_CFLAGS) -Iruntime -c $(GAME_C) -o $@
+
+$(IMAGE): $(WAREXE) tools/mkimage.py tools/le.py
+	$(PYTHON) tools/mkimage.py $@
+
+build/war: runtime/game.c runtime/x86.h build/game.o $(IMAGE)
+	$(CC) $(GAME_CFLAGS) -Iruntime $(SDL_CFLAGS) runtime/game.c build/game.o $(SDL_LIBS) -o $@
+
+war: build/war
+
+work/game/WAR.EXE: $(WAREXE)
+	cd tools && $(PYTHON) -c "import capture; capture.prepare()"
+
+play: build/war work/game/WAR.EXE
+	./build/war work/game $(IMAGE)
 
 $(LIFTED): $(WAREXE) tools/lift.py tools/disasm.py tools/le.py
 	@mkdir -p build
@@ -46,4 +73,4 @@ run: build/blitview $(FRAMES)
 	./build/blitview $(FRAMES)
 
 clean:
-	rm -f build/blitview $(LIFTED)
+	rm -f build/blitview $(LIFTED) build/war build/game.o $(GAME_C) $(IMAGE)

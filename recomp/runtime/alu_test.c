@@ -2,7 +2,7 @@
 #include "x86.h"
 
 enum { OP_ADD, OP_ADC, OP_SUB, OP_SBB, OP_AND, OP_OR, OP_XOR, OP_INC, OP_DEC, OP_NEG,
-       OP_SHL, OP_SHR, OP_SAR, OP_ROL, OP_ROR, OP_IMUL };
+       OP_SHL, OP_SHR, OP_SAR, OP_ROL, OP_ROR, OP_IMUL, OP_RCL, OP_RCR };
 
 #define EF_CF 0x001u
 #define EF_PF 0x004u
@@ -32,13 +32,15 @@ static uint32_t pack(const Flags *f) {
     case OP_SAR: r = sar##BITS(&f, a, b); break;                                    \
     case OP_ROL: r = rol##BITS(&f, a, b); break;                                    \
     case OP_ROR: r = ror##BITS(&f, a, b); break;                                    \
+    case OP_RCL: r = rcl##BITS(&f, a, b); break;                                    \
+    case OP_RCR: r = rcr##BITS(&f, a, b); break;                                    \
     default: return 0xDEADBEEF;                                                     \
     }
 
 /* Applies `op` at `bits` width to (a, b) starting from eflags `in`; returns the
  * result and stores the resulting CF/PF/ZF/SF/OF bits in *out. */
 uint32_t alu(int op, int bits, uint32_t a, uint32_t b, uint32_t in, uint32_t *out) {
-    Flags f = { !!(in & EF_CF), !!(in & EF_ZF), !!(in & EF_SF), !!(in & EF_OF), !!(in & EF_PF) };
+    Flags f = { !!(in & EF_CF), !!(in & EF_ZF), !!(in & EF_SF), !!(in & EF_OF), !!(in & EF_PF), 0 };
     uint32_t r = 0;
     if (op == OP_IMUL) {
         if (bits == 32) r = imul32(&f, a, b);

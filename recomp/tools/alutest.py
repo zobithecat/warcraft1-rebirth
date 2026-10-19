@@ -37,6 +37,7 @@ OPS = {
     "sar": (12, b"\xd3\xf8", b"\xd2\xf8", None), "rol": (13, b"\xd3\xc0", b"\xd2\xc0", None),
     "ror": (14, b"\xd3\xc8", b"\xd2\xc8", None),
     "imul": (15, b"\x0f\xaf\xc1", None, CF | OF),
+    "rcl": (16, b"\xd3\xd0", b"\xd2\xd0", None), "rcr": (17, b"\xd3\xd8", b"\xd2\xd8", None),
 }
 EDGE = [0, 1, 2, 0x7F, 0x80, 0xFF, 0x7FFF, 0x8000, 0xFFFF, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF]
 
@@ -49,7 +50,7 @@ def defined_flags(name: str, bits: int, count: int) -> int:
     n = count & 31
     if n == 0:
         return ARITH                     # all unchanged
-    if name in ("rol", "ror"):
+    if name in ("rol", "ror", "rcl", "rcr"):
         return CF | PF | ZF | SF | (OF if n == 1 else 0)    # ZF/SF/PF must be unchanged
     m = CF | PF | ZF | SF | (OF if n == 1 else 0)
     if bits < 32 and name in ("shl", "shr") and n > bits:
@@ -105,7 +106,7 @@ def main() -> None:
             bad, example = 0, None
             for _ in range(args.cases):
                 a = operand(rng, bits)
-                b = operand(rng, bits) if name not in ("shl", "shr", "sar", "rol", "ror") else \
+                b = operand(rng, bits) if name not in ("shl", "shr", "sar", "rol", "ror", "rcl", "rcr") else \
                     rng.choice([0, 1, 2, bits - 1, bits, bits + 1, 31, 32, rng.randrange(256)])
                 fin = rng.getrandbits(12) & ARITH
                 want_r, want_f = run_unicorn(uc, code, a, b, fin)

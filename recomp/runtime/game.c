@@ -1,0 +1,859 @@
+/* Native host for the recompiled war.exe.
+ *
+ * Plays the part of DOS + DOS/4GW + the PC hardware for the lifted code:
+ * loads the relocated image, builds a PSP/environment, answers the INT 21h
+ * (DOS), INT 31h (DPMI), INT 10h (video) and INT 33h (mouse) calls the game
+ * makes, emulates the few I/O ports it touches (VGA DAC, retrace, keyboard),
+ * shows mode 13h through SDL2 and feeds keyboard/mouse events to the game's
+ * own interrupt handlers.
+ *
+ *   war [GAME_DIR [IMAGE]]      defaults: work/game build/image.bin
+ *   WAR_TRACE=1 war ...         log every interrupt
+ */
+#include <SDL.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <time.h>
+
+#include "x86.h"
+
+typedef struct { uint32_t addr; void (*fn)(Cpu *); } LiftedEntry;
+extern const LiftedEntry lifted_table[];
+extern const unsigned lifted_table_len;
+
+/* ---- guest layout --------------------------------------------------------- */
+#define MEM_SIZE      (64u << 20)
+#define ENV_BASE      0x00000u     /* environment at linear 0: see LIFTER.md (implicit DS) */
+#define PSP_BASE      0x01000u
+#define DOS_POOL      0x02000u     /* DPMI 0100h "conventional" allocations */
+#define DOS_POOL_END  0x9F000u
+#define VGA_BASE      0xA0000u
+#define HEAP_BASE     0x00400000u  /* INT 21h 48h allocations */
+#define CALLBACK_RET  0xFFFFFFF0u  /* return address used when the host calls guest code */
+
+#define SEL_CODE 0x0008
+#define SEL_DATA 0x0010
+#define SEL_PSP  0x0018
+#define SEL_ENV  0x0020
+#define SEL_BIOS 0x0040
+#define SEL_FIRST_FREE 0x0080
+#define MAX_SEL  1024
+
+#define SCALE 3
+
+typedef struct {
+    uint32_t base[MAX_SEL];
+    uint8_t used[MAX_SEL];
+} Ldt;
+
+typedef struct {
+    FILE *fp;
+} Handle;
+
+typedef struct {
+    const char *game_dir;
+    Ldt ldt;
+    uint32_t pm_vector[256];      /* handlers the game installed */
+    uint32_t heap_top, dos_top;
+    Handle files[64];
+    /* video */
+    int mode;
+    uint8_t dac[768];
+    int dac_w, dac_wc, dac_r, dac_rc;
+    uint32_t retrace;
+    SDL_Window *win;
+    SDL_Renderer *ren;
+    SDL_Texture *tex;
+    uint64_t last_present;
+    /* input */
+    uint8_t keys[64];
+    int key_head, key_tail;
+    uint8_t last_scan;
+    uint32_t mouse_handler, mouse_mask;
+    int mouse_x, mouse_y, mouse_buttons;
+    int mx_min, mx_max, my_min, my_max;
+    int in_callback;
+    int trace;
+    int drive;                    /* current drive, 0 = A: (C: = game folder, D: = "CD") */
+    uint64_t start_ns;
+    uint64_t snapshot_ms;
+} Host;
+
+static Host H;
+
+static void die(Cpu *c, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "war: ");
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fprintf(stderr, "\n  eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n",
+            c->r[EAX], c->r[ECX], c->r[EDX], c->r[EBX], c->r[ESP], c->r[EBP], c->r[ESI], c->r[EDI]);
+    x86_stop(c, STOP_TRAP, 0);
+}
+
+/* ---- registers --------------------------------------------------------------- */
+#define AL(c) ((c)->r[EAX] & 0xFF)
+#define AH(c) (((c)->r[EAX] >> 8) & 0xFF)
+#define AX(c) ((c)->r[EAX] & 0xFFFF)
+#define BL(c) ((c)->r[EBX] & 0xFF)
+#define BX(c) ((c)->r[EBX] & 0xFFFF)
+#define CX(c) ((c)->r[ECX] & 0xFFFF)
+#define DX(c) ((c)->r[EDX] & 0xFFFF)
+#define SI(c) ((c)->r[ESI] & 0xFFFF)
+#define DI(c) ((c)->r[EDI] & 0xFFFF)
+static void set16(Cpu *c, int r, uint32_t v) { c->r[r] = (c->r[r] & 0xFFFF0000u) | (v & 0xFFFF); }
+static void set_al(Cpu *c, uint32_t v) { c->r[EAX] = (c->r[EAX] & ~0xFFu) | (v & 0xFF); }
+static void set_ah(Cpu *c, uint32_t v) { c->r[EAX] = (c->r[EAX] & ~0xFF00u) | ((v & 0xFF) << 8); }
+static void ok(Cpu *c) { c->f.cf = 0; }
+static void fail(Cpu *c, uint32_t code) { c->f.cf = 1; set16(c, EAX, code); }
+
+static uint8_t *G(Cpu *c, uint32_t a) { return c->mem + a; }
+
+/* ---- selectors ------------------------------------------------------------- */
+static uint32_t sel_base(Cpu *c, uint16_t sel) {
+    (void)c;
+    uint32_t i = sel >> 3;
+    return i < MAX_SEL ? H.ldt.base[i] : 0;
+}
+static uint16_t sel_alloc(uint32_t base) {
+    for (uint32_t i = SEL_FIRST_FREE >> 3; i < MAX_SEL; i++)
+        if (!H.ldt.used[i]) { H.ldt.used[i] = 1; H.ldt.base[i] = base; return (uint16_t)(i << 3 | 7); }
+    return 0;
+}
+static void sel_fixed(uint16_t sel, uint32_t base) { H.ldt.used[sel >> 3] = 1; H.ldt.base[sel >> 3] = base; }
+
+/* ---- calling guest code from the host ---------------------------------------- */
+static void dispatch(Cpu *c, uint32_t target, uint32_t at);
+
+/* Run a guest handler like the hardware/DPMI host would: iret frame or far call. */
+static void call_guest(Cpu *c, uint32_t handler, int iret_frame) {
+    uint32_t save[8];
+    memcpy(save, c->r, sizeof save);
+    Flags save_f = c->f;
+    uint32_t esp = c->r[ESP];
+    if (iret_frame) { esp -= 4; wr32(c, esp, x86_pack_flags(&c->f)); }
+    esp -= 4; wr32(c, esp, SEL_CODE);
+    esp -= 4; wr32(c, esp, CALLBACK_RET);
+    c->r[ESP] = esp;
+    H.in_callback++;
+    dispatch(c, handler, 0);
+    H.in_callback--;
+    memcpy(c->r, save, sizeof save);
+    c->f = save_f;
+}
+
+/* ---- video ------------------------------------------------------------------- */
+static void video_init(void) {
+    if (H.win) return;
+    if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); exit(1); }
+    H.win = SDL_CreateWindow("WarCraft (native arm64)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                             320 * SCALE, 200 * SCALE, SDL_WINDOW_ALLOW_HIGHDPI);
+    H.ren = SDL_CreateRenderer(H.win, -1, SDL_RENDERER_ACCELERATED);
+    H.tex = SDL_CreateTexture(H.ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 320, 200);
+    SDL_ShowCursor(SDL_DISABLE);
+}
+
+static void present(Cpu *c) {
+    if (!H.win) return;
+    static uint32_t px[320 * 200];
+    uint32_t lut[256];
+    for (int i = 0; i < 256; i++) {
+        const uint8_t *d = H.dac + i * 3;
+        lut[i] = 0xFF000000u | (uint32_t)(d[0] * 255 / 63) << 16 | (uint32_t)(d[1] * 255 / 63) << 8 |
+                 (uint32_t)(d[2] * 255 / 63);
+    }
+    const uint8_t *vram = G(c, VGA_BASE);
+    for (int i = 0; i < 320 * 200; i++) px[i] = lut[vram[i]];
+    SDL_UpdateTexture(H.tex, NULL, px, 320 * 4);
+    SDL_RenderClear(H.ren);
+    SDL_RenderCopy(H.ren, H.tex, NULL, NULL);
+    SDL_RenderPresent(H.ren);
+}
+
+/* ---- input -------------------------------------------------------------------- */
+static uint8_t pc_scancode(SDL_Scancode s) {
+    switch (s) {
+    case SDL_SCANCODE_ESCAPE: return 0x01;
+    case SDL_SCANCODE_1: return 0x02; case SDL_SCANCODE_2: return 0x03; case SDL_SCANCODE_3: return 0x04;
+    case SDL_SCANCODE_4: return 0x05; case SDL_SCANCODE_5: return 0x06; case SDL_SCANCODE_6: return 0x07;
+    case SDL_SCANCODE_7: return 0x08; case SDL_SCANCODE_8: return 0x09; case SDL_SCANCODE_9: return 0x0A;
+    case SDL_SCANCODE_0: return 0x0B; case SDL_SCANCODE_MINUS: return 0x0C; case SDL_SCANCODE_EQUALS: return 0x0D;
+    case SDL_SCANCODE_BACKSPACE: return 0x0E; case SDL_SCANCODE_TAB: return 0x0F;
+    case SDL_SCANCODE_Q: return 0x10; case SDL_SCANCODE_W: return 0x11; case SDL_SCANCODE_E: return 0x12;
+    case SDL_SCANCODE_R: return 0x13; case SDL_SCANCODE_T: return 0x14; case SDL_SCANCODE_Y: return 0x15;
+    case SDL_SCANCODE_U: return 0x16; case SDL_SCANCODE_I: return 0x17; case SDL_SCANCODE_O: return 0x18;
+    case SDL_SCANCODE_P: return 0x19; case SDL_SCANCODE_LEFTBRACKET: return 0x1A; case SDL_SCANCODE_RIGHTBRACKET: return 0x1B;
+    case SDL_SCANCODE_RETURN: return 0x1C; case SDL_SCANCODE_LCTRL: case SDL_SCANCODE_RCTRL: return 0x1D;
+    case SDL_SCANCODE_A: return 0x1E; case SDL_SCANCODE_S: return 0x1F; case SDL_SCANCODE_D: return 0x20;
+    case SDL_SCANCODE_F: return 0x21; case SDL_SCANCODE_G: return 0x22; case SDL_SCANCODE_H: return 0x23;
+    case SDL_SCANCODE_J: return 0x24; case SDL_SCANCODE_K: return 0x25; case SDL_SCANCODE_L: return 0x26;
+    case SDL_SCANCODE_SEMICOLON: return 0x27; case SDL_SCANCODE_APOSTROPHE: return 0x28; case SDL_SCANCODE_GRAVE: return 0x29;
+    case SDL_SCANCODE_LSHIFT: return 0x2A; case SDL_SCANCODE_BACKSLASH: return 0x2B;
+    case SDL_SCANCODE_Z: return 0x2C; case SDL_SCANCODE_X: return 0x2D; case SDL_SCANCODE_C: return 0x2E;
+    case SDL_SCANCODE_V: return 0x2F; case SDL_SCANCODE_B: return 0x30; case SDL_SCANCODE_N: return 0x31;
+    case SDL_SCANCODE_M: return 0x32; case SDL_SCANCODE_COMMA: return 0x33; case SDL_SCANCODE_PERIOD: return 0x34;
+    case SDL_SCANCODE_SLASH: return 0x35; case SDL_SCANCODE_RSHIFT: return 0x36;
+    case SDL_SCANCODE_LALT: case SDL_SCANCODE_RALT: return 0x38; case SDL_SCANCODE_SPACE: return 0x39;
+    case SDL_SCANCODE_F1: return 0x3B; case SDL_SCANCODE_F2: return 0x3C; case SDL_SCANCODE_F3: return 0x3D;
+    case SDL_SCANCODE_F4: return 0x3E; case SDL_SCANCODE_F5: return 0x3F; case SDL_SCANCODE_F6: return 0x40;
+    case SDL_SCANCODE_F7: return 0x41; case SDL_SCANCODE_F8: return 0x42; case SDL_SCANCODE_F9: return 0x43;
+    case SDL_SCANCODE_F10: return 0x44;
+    case SDL_SCANCODE_UP: return 0x48; case SDL_SCANCODE_LEFT: return 0x4B;
+    case SDL_SCANCODE_RIGHT: return 0x4D; case SDL_SCANCODE_DOWN: return 0x50;
+    case SDL_SCANCODE_PAGEUP: return 0x49; case SDL_SCANCODE_PAGEDOWN: return 0x51;
+    case SDL_SCANCODE_HOME: return 0x47; case SDL_SCANCODE_END: return 0x4F;
+    case SDL_SCANCODE_INSERT: return 0x52; case SDL_SCANCODE_DELETE: return 0x53;
+    default: return 0;
+    }
+}
+
+static void key_event(Cpu *c, uint8_t scan) {
+    H.last_scan = scan;
+    if (H.pm_vector[9]) call_guest(c, H.pm_vector[9], 1);      /* the game's own keyboard ISR */
+}
+
+static void mouse_event(Cpu *c, uint32_t mask) {
+    if (!H.mouse_handler || !(H.mouse_mask & mask) || H.in_callback) return;
+    uint32_t save[8];
+    memcpy(save, c->r, sizeof save);
+    c->r[EAX] = mask;
+    c->r[EBX] = (uint32_t)H.mouse_buttons;
+    c->r[ECX] = (uint32_t)H.mouse_x;
+    c->r[EDX] = (uint32_t)H.mouse_y;
+    c->r[ESI] = c->r[EDI] = 0;
+    call_guest(c, H.mouse_handler, 0);
+    memcpy(c->r, save, sizeof save);
+}
+
+/* Scripted input for unattended runs: WAR_INPUT="5:esc,9:return,12:click@160,100,20:snap"
+ * (seconds since start; keys by name, mouse clicks in 320x200 coordinates). */
+typedef struct { uint64_t ms; char what[32]; } ScriptStep;
+static ScriptStep script[64];
+static int script_len, script_pos;
+
+static void parse_script(const char *s) {
+    while (s && *s && script_len < 64) {
+        ScriptStep *st = &script[script_len++];
+        st->ms = (uint64_t)(atof(s) * 1000);
+        const char *colon = strchr(s, ':');
+        if (!colon) break;
+        const char *end = strchr(colon + 1, ',');
+        while (end && end[1] >= '0' && end[1] <= '9' && strchr(end + 1, ':') == NULL) end = strchr(end + 1, ',');
+        size_t n = end ? (size_t)(end - colon - 1) : strlen(colon + 1);
+        /* click@x,y contains a comma: take it whole */
+        if (strncmp(colon + 1, "click@", 6) == 0) {
+            const char *c2 = strchr(colon + 1, ',');
+            end = c2 ? strchr(c2 + 1, ',') : NULL;
+            n = end ? (size_t)(end - colon - 1) : strlen(colon + 1);
+        }
+        snprintf(st->what, sizeof st->what, "%.*s", (int)n, colon + 1);
+        s = end ? end + 1 : NULL;
+    }
+}
+
+static void snapshot(Cpu *c, const char *path);
+static void key_event(Cpu *c, uint8_t scan);
+static void mouse_event(Cpu *c, uint32_t mask);
+
+static void run_script(Cpu *c, uint64_t now) {
+    static const struct { const char *name; uint8_t scan; } keys[] = {
+        {"esc", 0x01}, {"return", 0x1C}, {"space", 0x39}, {"up", 0x48}, {"down", 0x50},
+        {"left", 0x4B}, {"right", 0x4D}, {"n", 0x31}, {"y", 0x15}, {"s", 0x1F}, {"h", 0x23}, {"o", 0x18},
+        {"c", 0x2E}, {"l", 0x26}, {"q", 0x10}, {"x", 0x2D}, {"e", 0x12}, {"t", 0x14},
+    };
+    while (script_pos < script_len && now >= script[script_pos].ms) {
+        const char *w = script[script_pos++].what;
+        if (strcmp(w, "snap") == 0) {
+            char path[64];
+            snprintf(path, sizeof path, "build/screen_%llu.ppm", (unsigned long long)(now / 1000));
+            snapshot(c, path);
+            fprintf(stderr, "war: saved %s\n", path);
+        } else if (strncmp(w, "click@", 6) == 0) {
+            int x = 0, y = 0;
+            sscanf(w + 6, "%d,%d", &x, &y);
+            H.mouse_x = H.mx_min + x * (H.mx_max - H.mx_min + 1) / 320;
+            H.mouse_y = H.my_min + y * (H.my_max - H.my_min + 1) / 200;
+            mouse_event(c, 1);
+            H.mouse_buttons |= 1; mouse_event(c, 2);
+            H.mouse_buttons &= ~1; mouse_event(c, 4);
+        } else if (strcmp(w, "quit") == 0) {
+            x86_stop(c, STOP_EXIT, 0);
+        } else {
+            for (size_t k = 0; k < sizeof keys / sizeof keys[0]; k++)
+                if (strcmp(w, keys[k].name) == 0) { key_event(c, keys[k].scan); key_event(c, keys[k].scan | 0x80); }
+        }
+    }
+}
+
+static void snapshot(Cpu *c, const char *path) {
+    FILE *f = fopen(path, "wb");
+    if (!f) return;
+    fprintf(f, "P6\n320 200\n255\n");
+    const uint8_t *vram = G(c, VGA_BASE);
+    for (int i = 0; i < 320 * 200; i++) {
+        const uint8_t *d = H.dac + vram[i] * 3;
+        uint8_t rgb[3] = { (uint8_t)(d[0] * 255 / 63), (uint8_t)(d[1] * 255 / 63), (uint8_t)(d[2] * 255 / 63) };
+        fwrite(rgb, 1, 3, f);
+    }
+    fclose(f);
+}
+
+/* Window events -> game; redraw at most ~60 times a second. */
+static void pump(Cpu *c) {
+    uint64_t now = SDL_GetTicks64();
+    if (now - H.last_present < 16) return;
+    H.last_present = now;
+    run_script(c, now);
+    if (H.snapshot_ms && now >= H.snapshot_ms) {     /* WAR_SNAPSHOT=seconds: save the screen and quit */
+        snapshot(c, "build/screen.ppm");
+        fprintf(stderr, "war: saved build/screen.ppm\n");
+        x86_stop(c, STOP_EXIT, 0);
+    }
+    present(c);
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        switch (e.type) {
+        case SDL_QUIT:
+            x86_stop(c, STOP_EXIT, 0);
+            break;
+        case SDL_KEYDOWN: case SDL_KEYUP: {
+            if (e.key.repeat) break;
+            uint8_t s = pc_scancode(e.key.keysym.scancode);
+            if (s) key_event(c, e.type == SDL_KEYUP ? (uint8_t)(s | 0x80) : s);
+            break;
+        }
+        case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
+            int wx, wy, ww, wh;
+            SDL_GetMouseState(&wx, &wy);
+            SDL_GetWindowSize(H.win, &ww, &wh);
+            int span_x = H.mx_max - H.mx_min, span_y = H.my_max - H.my_min;
+            H.mouse_x = H.mx_min + (ww ? wx * (span_x + 1) / ww : 0);
+            H.mouse_y = H.my_min + (wh ? wy * (span_y + 1) / wh : 0);
+            if (H.mouse_x > H.mx_max) H.mouse_x = H.mx_max;
+            if (H.mouse_y > H.my_max) H.mouse_y = H.my_max;
+            uint32_t mask = 1;
+            if (e.type != SDL_MOUSEMOTION) {
+                int bit = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_RIGHT ? 2 : 4;
+                if (e.type == SDL_MOUSEBUTTONDOWN) { H.mouse_buttons |= bit; mask = bit == 1 ? 2 : bit == 2 ? 8 : 32; }
+                else { H.mouse_buttons &= ~bit; mask = bit == 1 ? 4 : bit == 2 ? 16 : 64; }
+            }
+            mouse_event(c, mask);
+            break;
+        }
+        }
+    }
+}
+
+/* ---- files -------------------------------------------------------------------- */
+/* DOS path -> host path inside the game folder, matching names case-insensitively. */
+static int host_path(Cpu *c, uint32_t dos, char *out, size_t n) {
+    char p[260];
+    size_t k = 0;
+    const char *s = (const char *)G(c, dos);
+    if (s[0] && s[1] == ':') s += 2;
+    while (*s == '\\' || *s == '/') s++;
+    for (; *s && k + 1 < sizeof p; s++) p[k++] = *s == '\\' ? '/' : *s;
+    p[k] = 0;
+    /* resolve each component case-insensitively */
+    char cur[1024];
+    snprintf(cur, sizeof cur, "%s", H.game_dir);
+    char *save = NULL;
+    for (char *part = strtok_r(p, "/", &save); part; part = strtok_r(NULL, "/", &save)) {
+        DIR *d = opendir(cur);
+        char match[256] = "";
+        if (d) {
+            struct dirent *e;
+            while ((e = readdir(d)))
+                if (strcasecmp(e->d_name, part) == 0) { snprintf(match, sizeof match, "%s", e->d_name); break; }
+            closedir(d);
+        }
+        size_t len = strlen(cur);
+        snprintf(cur + len, sizeof cur - len, "/%s", match[0] ? match : part);
+    }
+    snprintf(out, n, "%s", cur);
+    return 0;
+}
+
+/* Is this DOS path on the D: "CD" (explicitly, or relative while D: is current)? */
+static int on_cd(Cpu *c, uint32_t dos) {
+    const char *s = (const char *)G(c, dos);
+    if (s[0] && s[1] == ':') return toupper((unsigned char)s[0]) == 'D';
+    return H.drive == 3;
+}
+
+static int new_handle(FILE *fp) {
+    for (int h = 5; h < 64; h++) if (!H.files[h].fp) { H.files[h].fp = fp; return h; }
+    fclose(fp);
+    return -1;
+}
+
+/* ---- INT 21h: DOS ---------------------------------------------------------------- */
+static void int21(Cpu *c, uint32_t at) {
+    char path[1024];
+    switch (AH(c)) {
+    case 0x30:                                     /* DOS version: 5.0 */
+        c->r[EAX] = 0x0005;
+        break;
+    case 0xFF:                                     /* DOS/4GW presence check (AX=FF00h, DX=78h) */
+        if (AX(c) == 0xFF00) { c->r[EAX] = 0xFFFF3447; x86_load_seg(c, SEG_GS, 0); break; }
+        die(c, "int 21h AX=%04x at %x", AX(c), at);
+        break;
+    case 0x25:                                     /* set vector */
+        H.pm_vector[AL(c)] = c->r[EDX];
+        break;
+    case 0x35:                                     /* get vector */
+        x86_load_seg(c, SEG_ES, SEL_CODE);
+        c->r[EBX] = H.pm_vector[AL(c)];
+        break;
+    case 0x2A: {                                   /* date */
+        time_t t = time(NULL);
+        struct tm tm;
+        localtime_r(&t, &tm);
+        set16(c, ECX, (uint32_t)tm.tm_year + 1900);
+        set16(c, EDX, (uint32_t)((tm.tm_mon + 1) << 8 | tm.tm_mday));
+        set_al(c, (uint32_t)tm.tm_wday);
+        break;
+    }
+    case 0x2C: {                                   /* time: the game's clock() */
+        pump(c);
+        uint64_t cs = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - H.start_ns) / 10000000ull + 12ull * 360000;
+        uint32_t day = (uint32_t)(cs % 8640000ull);
+        set16(c, ECX, (day / 360000) << 8 | (day / 6000) % 60);
+        set16(c, EDX, ((day / 100) % 60) << 8 | day % 100);
+        break;
+    }
+    case 0x19: set_al(c, (uint32_t)H.drive); break;   /* current drive */
+    case 0x0E:                                     /* select drive: C: and the D: "CD" exist */
+        if ((c->r[EDX] & 0xFF) == 2 || (c->r[EDX] & 0xFF) == 3) H.drive = c->r[EDX] & 0xFF;
+        set_al(c, 26);
+        break;
+    case 0x3B: ok(c); break;                      /* chdir */
+    case 0x47: G(c, c->r[ESI])[0] = 0; ok(c); break;   /* cwd: root */
+    case 0x36: {                                   /* disk free; DL: 0 = current, 3 = C:, 4 = D: */
+        int d = (c->r[EDX] & 0xFF) ? (int)(c->r[EDX] & 0xFF) - 1 : H.drive;
+        if (d == 3) {                              /* the CD: full, 2K sectors */
+            set16(c, EAX, 1); set16(c, EBX, 0); set16(c, ECX, 2048); set16(c, EDX, 0x8000);
+        } else if (d == 2) {
+            set16(c, EAX, 8); set16(c, EBX, 0xFFFF); set16(c, ECX, 512); set16(c, EDX, 0xFFFF);
+        } else {
+            set16(c, EAX, 0xFFFF);                 /* invalid drive */
+        }
+        break;
+    }
+    case 0x4A: ok(c); break;                       /* resize block */
+    case 0x48: {                                   /* allocate: BX paragraphs */
+        uint32_t bytes = BX(c) * 16u;
+        if (H.heap_top + bytes > MEM_SIZE) { fail(c, 8); set16(c, EBX, 0); break; }
+        uint16_t sel = sel_alloc(H.heap_top);
+        H.heap_top = (H.heap_top + bytes + 15) & ~15u;
+        set16(c, EAX, sel);
+        ok(c);
+        break;
+    }
+    case 0x49: ok(c); break;                       /* free */
+    case 0x3C: case 0x3D: {                        /* create / open */
+        host_path(c, c->r[EDX], path, sizeof path);
+        const char *mode = AH(c) == 0x3C ? "w+b" : ((AL(c) & 3) == 0 ? "rb" : "r+b");
+        FILE *fp = fopen(path, mode);
+        if (!fp && AH(c) == 0x3D && strcasecmp(strrchr(path, '/') ? strrchr(path, '/') + 1 : path, "path.war") == 0) {
+            /* INSTALL.EXE writes the CD's path here; without it, point at our D: "CD". */
+            fp = tmpfile();
+            if (fp) { fwrite("D:\\", 1, 4, fp); rewind(fp); }
+        }
+        if (H.trace) fprintf(stderr, "  open %s (%s) -> %s\n", (char *)G(c, c->r[EDX]), path, fp ? "ok" : "fail");
+        if (!fp) { fail(c, 2); break; }
+        int h = new_handle(fp);
+        if (h < 0) { fail(c, 4); break; }
+        c->r[EAX] = (uint32_t)h;
+        ok(c);
+        break;
+    }
+    case 0x3E:                                     /* close */
+        if (BX(c) < 64 && H.files[BX(c)].fp) { fclose(H.files[BX(c)].fp); H.files[BX(c)].fp = NULL; }
+        ok(c);
+        break;
+    case 0x3F: {                                   /* read */
+        uint32_t h = BX(c), n = c->r[ECX];
+        if (h >= 64 || !H.files[h].fp) {
+            if (h == 0) { c->r[EAX] = 0; ok(c); break; }
+            fail(c, 6); break;
+        }
+        c->r[EAX] = (uint32_t)fread(G(c, c->r[EDX]), 1, n, H.files[h].fp);
+        ok(c);
+        break;
+    }
+    case 0x40: {                                   /* write */
+        uint32_t h = BX(c), n = c->r[ECX];
+        if (h == 1 || h == 2) { fwrite(G(c, c->r[EDX]), 1, n, stderr); c->r[EAX] = n; ok(c); break; }
+        if (h >= 64 || !H.files[h].fp) { fail(c, 6); break; }
+        c->r[EAX] = (uint32_t)fwrite(G(c, c->r[EDX]), 1, n, H.files[h].fp);
+        ok(c);
+        break;
+    }
+    case 0x42: {                                   /* lseek */
+        uint32_t h = BX(c);
+        if (h >= 64 || !H.files[h].fp) { fail(c, 6); break; }
+        long off = (long)(int32_t)(CX(c) << 16 | DX(c));
+        int whence = AL(c) == 0 ? SEEK_SET : AL(c) == 1 ? SEEK_CUR : SEEK_END;
+        if (fseek(H.files[h].fp, off, whence) != 0) { fail(c, 25); break; }
+        long pos = ftell(H.files[h].fp);
+        set16(c, EAX, (uint32_t)pos & 0xFFFF);
+        set16(c, EDX, (uint32_t)pos >> 16);
+        ok(c);
+        break;
+    }
+    case 0x41:                                     /* delete */
+        host_path(c, c->r[EDX], path, sizeof path);
+        if (remove(path) != 0) fail(c, 2); else ok(c);
+        break;
+    case 0x43: {                                   /* attributes */
+        host_path(c, c->r[EDX], path, sizeof path);
+        struct stat st;
+        if (stat(path, &st) != 0) { fail(c, 2); break; }
+        if (AL(c) == 1) {                          /* set: the D: "CD" is read-only */
+            if (on_cd(c, c->r[EDX])) fail(c, 5); else ok(c);
+            break;
+        }
+        set16(c, ECX, S_ISDIR(st.st_mode) ? 0x10 : 0x20);
+        ok(c);
+        break;
+    }
+    case 0x44:                                     /* IOCTL: device information */
+        if (AL(c) == 0) { set16(c, EDX, BX(c) < 5 ? 0x80D3 : 0x0002); ok(c); break; }
+        fail(c, 1);
+        break;
+    case 0x06:                                     /* direct console input: nothing waiting */
+        if ((c->r[EDX] & 0xFF) == 0xFF) { set_al(c, 0); c->f.zf = 1; }
+        break;
+    case 0x4C:
+        x86_stop(c, STOP_EXIT, AL(c));
+        break;
+    default:
+        die(c, "unhandled int 21h AH=%02x at %x", AH(c), at);
+    }
+}
+
+/* ---- INT 31h: DPMI ------------------------------------------------------------- */
+static void int31(Cpu *c, uint32_t at) {
+    switch (AX(c)) {
+    case 0x0000: {                                 /* allocate LDT descriptors */
+        uint16_t first = 0;
+        for (uint32_t k = 0; k < CX(c); k++) { uint16_t s = sel_alloc(0); if (!k) first = s; }
+        set16(c, EAX, first); ok(c);
+        break;
+    }
+    case 0x0001: H.ldt.used[BX(c) >> 3] = 0; ok(c); break;
+    case 0x0003: set16(c, EAX, 8); ok(c); break;
+    case 0x0006: {                                 /* get segment base */
+        uint32_t b = sel_base(c, (uint16_t)BX(c));
+        set16(c, ECX, b >> 16); set16(c, EDX, b & 0xFFFF); ok(c);
+        break;
+    }
+    case 0x0007:                                   /* set segment base */
+        H.ldt.used[BX(c) >> 3] = 1;
+        H.ldt.base[BX(c) >> 3] = (uint32_t)CX(c) << 16 | DX(c);
+        ok(c);
+        break;
+    case 0x0008: case 0x0009: ok(c); break;        /* limit / rights: everything is flat */
+    case 0x0100: {                                 /* allocate DOS memory: BX paragraphs */
+        uint32_t bytes = BX(c) * 16u;
+        if (H.dos_top + bytes > DOS_POOL_END) { fail(c, 8); set16(c, EBX, (DOS_POOL_END - H.dos_top) / 16); break; }
+        uint32_t base = H.dos_top;
+        H.dos_top = (H.dos_top + bytes + 15) & ~15u;
+        set16(c, EAX, base >> 4);
+        set16(c, EDX, sel_alloc(base));
+        ok(c);
+        break;
+    }
+    case 0x0101: H.ldt.used[DX(c) >> 3] = 0; ok(c); break;
+    case 0x0200: set16(c, ECX, 0); set16(c, EDX, 0); ok(c); break;
+    case 0x0201: ok(c); break;
+    case 0x0204: set16(c, ECX, SEL_CODE); c->r[EDX] = H.pm_vector[BL(c)]; ok(c); break;
+    case 0x0205: H.pm_vector[BL(c)] = c->r[EDX]; ok(c); break;
+    case 0x0300: case 0x0303: c->f.cf = 1; break; /* no real mode: IPX/callbacks unavailable */
+    case 0x0304: ok(c); break;
+    case 0x0400: set16(c, EAX, 0x005A); set16(c, EBX, 0x0005); set16(c, ECX, 3); set16(c, EDX, 0x0870); ok(c); break;
+    case 0x0500: {                                 /* free memory information */
+        uint8_t *info = G(c, c->r[EDI] + c->sbase[SEG_ES]);
+        uint32_t free_bytes = MEM_SIZE - H.heap_top;
+        memset(info, 0xFF, 48);
+        memcpy(info, &free_bytes, 4);
+        ok(c);
+        break;
+    }
+    case 0x0002:                                   /* real-mode segment -> selector */
+        set16(c, EAX, sel_alloc((uint32_t)BX(c) << 4));
+        ok(c);
+        break;
+    case 0x0501: case 0x0503: {                    /* allocate / resize memory block: BX:CX bytes */
+        uint32_t bytes = (uint32_t)BX(c) << 16 | CX(c);
+        uint32_t base = (H.heap_top + 0xFFF) & ~0xFFFu;
+        if (base + bytes > MEM_SIZE) { fail(c, 0x8013); break; }
+        if (AX(c) == 0x0503) {                     /* resize: copy the old block (handle = its address) */
+            uint32_t old = (uint32_t)SI(c) << 16 | DI(c);
+            memmove(G(c, base), G(c, old), bytes);
+        }
+        H.heap_top = base + bytes;
+        set16(c, EBX, base >> 16); set16(c, ECX, base & 0xFFFF);
+        set16(c, ESI, base >> 16); set16(c, EDI, base & 0xFFFF);
+        ok(c);
+        break;
+    }
+    case 0x0502: ok(c); break;                     /* free memory block (bump allocator) */
+    case 0x0600: case 0x0601: ok(c); break;        /* lock / unlock */
+    default:
+        die(c, "unhandled int 31h AX=%04x at %x", AX(c), at);
+    }
+}
+
+/* ---- INT 10h: video, INT 33h: mouse --------------------------------------------- */
+static void int10(Cpu *c, uint32_t at) {
+    switch (AH(c)) {
+    case 0x00:
+        H.mode = AL(c) & 0x7F;
+        if (H.mode == 0x13) { video_init(); if (!(AL(c) & 0x80)) memset(G(c, VGA_BASE), 0, 64000); }
+        break;
+    case 0x0F: set_al(c, (uint32_t)H.mode); set_ah(c, H.mode == 0x13 ? 40 : 80); c->r[EBX] &= ~0xFF00u; break;
+    default:
+        die(c, "unhandled int 10h AH=%02x at %x", AH(c), at);
+    }
+}
+
+static void int33(Cpu *c, uint32_t at) {
+    switch (AX(c)) {
+    case 0x00: set16(c, EAX, 0xFFFF); set16(c, EBX, 2); break;
+    case 0x01: case 0x02: break;
+    case 0x03: pump(c); set16(c, EBX, (uint32_t)H.mouse_buttons); set16(c, ECX, (uint32_t)H.mouse_x); set16(c, EDX, (uint32_t)H.mouse_y); break;
+    case 0x04: H.mouse_x = CX(c); H.mouse_y = DX(c); break;
+    case 0x07: H.mx_min = (int16_t)CX(c); H.mx_max = (int16_t)DX(c); break;
+    case 0x08: H.my_min = (int16_t)CX(c); H.my_max = (int16_t)DX(c); break;
+    case 0x0C: H.mouse_mask = CX(c); H.mouse_handler = c->r[EDX]; break;
+    case 0x0F: case 0x1A: case 0x1D: break;
+    default:
+        die(c, "unhandled int 33h AX=%04x at %x", AX(c), at);
+    }
+}
+
+static void on_int(Cpu *c, int vec, uint32_t at) {
+    if (H.trace) fprintf(stderr, "int %02xh ax=%04x bx=%04x cx=%04x dx=%04x at %x\n", vec, AX(c), BX(c), CX(c), DX(c), at);
+    switch (vec) {
+    case 0x21: int21(c, at); break;
+    case 0x31: int31(c, at); break;
+    case 0x10: int10(c, at); break;
+    case 0x33: int33(c, at); break;
+    case 0x2F: if (AX(c) == 0x1686) set16(c, EAX, 0); break;     /* DPMI present */
+    default: die(c, "unhandled int %02xh at %x", vec, at);
+    }
+}
+
+/* ---- ports --------------------------------------------------------------------- */
+static uint32_t on_in(Cpu *c, uint32_t port, int bytes) {
+    (void)bytes;
+    switch (port) {
+    case 0x3DA:                                    /* input status: alternate retrace */
+        pump(c);
+        H.retrace ^= 0x09;
+        return H.retrace;
+    case 0x3C9: {
+        uint8_t v = H.dac[(H.dac_r * 3 + H.dac_rc) % 768];
+        if (++H.dac_rc == 3) { H.dac_rc = 0; H.dac_r = (H.dac_r + 1) & 0xFF; }
+        return v;
+    }
+    case 0x60: return H.last_scan;
+    case 0x61: case 0x21: case 0xA1: return 0;
+    default:
+        if (H.trace) fprintf(stderr, "in %x\n", port);
+        return 0xFF;
+    }
+}
+
+static void on_out(Cpu *c, uint32_t port, uint32_t v, int bytes) {
+    (void)c; (void)bytes;
+    switch (port) {
+    case 0x3C8: H.dac_w = v & 0xFF; H.dac_wc = 0; break;
+    case 0x3C7: H.dac_r = v & 0xFF; H.dac_rc = 0; break;
+    case 0x3C9:
+        H.dac[(H.dac_w * 3 + H.dac_wc) % 768] = v & 63;
+        if (++H.dac_wc == 3) { H.dac_wc = 0; H.dac_w = (H.dac_w + 1) & 0xFF; }
+        break;
+    default:
+        if (H.trace) fprintf(stderr, "out %x <- %x\n", port, v);
+    }
+}
+
+/* ---- indirect calls, traps ------------------------------------------------------ */
+static void dispatch(Cpu *c, uint32_t target, uint32_t at) {
+    unsigned lo = 0, hi = lifted_table_len;
+    while (lo < hi) {
+        unsigned mid = (lo + hi) / 2;
+        if (lifted_table[mid].addr < target) lo = mid + 1; else hi = mid;
+    }
+    if (lo < lifted_table_len && lifted_table[lo].addr == target) { lifted_table[lo].fn(c); return; }
+    die(c, "call to %x (no lifted function) from %x", target, at);
+}
+
+static void on_trap(Cpu *c, uint32_t at, const char *what) {
+    fprintf(stderr, "war: untranslated instruction at %x: %s\n", at, what);
+    (void)c;
+}
+
+/* ---- functions replaced by the runtime (lift.py HLE) ------------------------- */
+static void on_hle(Cpu *c, uint32_t func) {
+    switch (func) {
+    case 0x3CC50: {      /* int386x core: ESI = vector, EBX -> SREGS, EDI -> REGS in */
+        uint32_t vec = c->r[ESI] & 0xFF, sregs = c->r[EBX], in = c->r[EDI];
+        uint32_t ds = rd16(c, sregs + 6);
+        x86_load_seg(c, SEG_ES, rd16(c, sregs));
+        c->r[EBP] = (c->r[EBP] & 0xFFFF0000u) | ds;
+        c->r[EAX] = rd32(c, in);
+        c->r[EBX] = rd32(c, in + 4);
+        c->r[ECX] = rd32(c, in + 8);
+        c->r[EDX] = rd32(c, in + 12);
+        c->r[ESI] = rd32(c, in + 16);
+        c->r[EDI] = rd32(c, in + 20);
+        x86_load_seg(c, SEG_DS, ds);
+        on_int(c, (int)vec, func);
+        c->ret_to = rd32(c, c->r[ESP]);           /* the stub's `ret` returns to our caller */
+        c->r[ESP] += 4;
+        break;
+    }
+    default:
+        die(c, "no runtime implementation for %x", func);
+    }
+}
+
+static const Hooks HOOKS = { on_int, on_in, on_out, dispatch, on_trap, sel_base, on_hle };
+
+/* ---- checkpoint dumps (debugging; RECOMP_TRACE builds) ------------------------------ */
+#ifdef RECOMP_TRACE
+static unsigned dump_skip;
+
+/* Entry state of c->dump_at: regs, flags, segments, then all guest memory.
+ * tools/ckdiff.py replays it on Unicorn and on the lifted code. */
+static void print_stack(Cpu *c) {
+    fprintf(stderr, " call stack (innermost first):");
+    for (uint32_t k = 0; k < 10 && k < c->depth; k++) fprintf(stderr, " %x", c->stack[(c->depth - 1 - k) & 255]);
+    fprintf(stderr, "\n");
+}
+
+void x86_on_watch(Cpu *c, uint32_t addr, uint32_t n) {
+    fprintf(stderr, "watch: write %u bytes at %x;", n, addr);
+    print_stack(c);
+}
+
+void x86_on_enter(Cpu *c, uint32_t addr) {
+    if (dump_skip) { dump_skip--; return; }
+    char path[64];
+    snprintf(path, sizeof path, "build/dump_%x.bin", addr);
+    FILE *f = fopen(path, "wb");
+    uint32_t hdr[4] = { 0x31504D44, addr, MEM_SIZE, x86_pack_flags(&c->f) };
+    fwrite(hdr, 4, 4, f);
+    fwrite(c->r, 4, 8, f);
+    fwrite(c->sbase, 4, 6, f);
+    fwrite(c->mem, 1, MEM_SIZE, f);
+    fclose(f);
+    fprintf(stderr, "war: dumped entry state of %x to %s\n", addr, path);
+    x86_stop(c, STOP_EXIT, 0);
+}
+#endif
+
+/* ---- boot -------------------------------------------------------------------------- */
+static uint8_t *load_image(const char *path, uint32_t *entry, uint32_t *esp, uint8_t *mem, uint32_t *top) {
+    FILE *f = fopen(path, "rb");
+    if (!f) { perror(path); exit(1); }
+    uint32_t hdr[7];
+    if (fread(hdr, 4, 7, f) != 7 || hdr[0] != 0x314D4957) { fprintf(stderr, "%s: bad image\n", path); exit(1); }
+    if (fread(mem + hdr[3], 1, hdr[4], f) != hdr[4]) { fprintf(stderr, "%s: truncated\n", path); exit(1); }
+    fclose(f);
+    *entry = hdr[1];
+    *esp = hdr[2];
+    *top = hdr[3] + hdr[4];
+    return mem;
+}
+
+static void build_psp_env(uint8_t *mem) {
+    static const char env[] = "PATH=C:\\\0COMSPEC=C:\\COMMAND.COM\0BLASTER=\0\0\x01\0C:\\WAR.EXE\0";
+    memcpy(mem + ENV_BASE, env, sizeof env);
+    uint8_t *psp = mem + PSP_BASE;
+    psp[0] = 0xCD; psp[1] = 0x20;                  /* int 20h */
+    uint16_t env_sel = SEL_ENV;
+    memcpy(psp + 0x2C, &env_sel, 2);
+    psp[0x80] = 0;                                 /* empty command tail */
+    psp[0x81] = '\r';
+}
+
+int main(int argc, char *argv[]) {
+    H.game_dir = argc > 1 ? argv[1] : "work/game";
+    const char *image = argc > 2 ? argv[2] : "build/image.bin";
+    H.trace = getenv("WAR_TRACE") != NULL;
+    if (getenv("WAR_SNAPSHOT")) H.snapshot_ms = (uint64_t)(atof(getenv("WAR_SNAPSHOT")) * 1000);
+    parse_script(getenv("WAR_INPUT"));
+    H.start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    H.mx_max = 639; H.my_max = 199;
+    H.drive = 2;
+
+    static Cpu c;
+    memset(&c, 0, sizeof c);
+    c.mem = calloc(1, MEM_SIZE);
+    c.mem_size = MEM_SIZE;
+    c.budget = INT64_MAX;
+    c.hooks = &HOOKS;
+    uint32_t entry, esp, top;
+    load_image(image, &entry, &esp, c.mem, &top);
+    build_psp_env(c.mem);
+    H.heap_top = HEAP_BASE;
+    H.dos_top = DOS_POOL;
+    sel_fixed(SEL_CODE, 0);
+    sel_fixed(SEL_DATA, 0);
+    sel_fixed(SEL_PSP, PSP_BASE);
+    sel_fixed(SEL_ENV, ENV_BASE);
+    sel_fixed(SEL_BIOS, 0x400);
+
+    /* registers as DOS/4GW hands them to a flat-model program */
+    x86_load_seg(&c, SEG_CS, SEL_CODE);
+    x86_load_seg(&c, SEG_DS, SEL_DATA);
+    x86_load_seg(&c, SEG_SS, SEL_DATA);
+    x86_load_seg(&c, SEG_ES, SEL_PSP);
+    c.r[ESP] = esp - 4;
+    wr32(&c, c.r[ESP], CALLBACK_RET);
+    c.f.df = 0;
+
+#ifdef RECOMP_TRACE
+    if (getenv("WAR_DUMP_AT")) c.dump_at = (uint32_t)strtoul(getenv("WAR_DUMP_AT"), NULL, 16);
+    if (getenv("WAR_DUMP_SKIP")) dump_skip = (unsigned)atoi(getenv("WAR_DUMP_SKIP"));
+    if (getenv("WAR_WATCH")) {                     /* WAR_WATCH=addr[,len] */
+        char *end;
+        c.watch_lo = (uint32_t)strtoul(getenv("WAR_WATCH"), &end, 16);
+        c.watch_hi = c.watch_lo + (*end == ',' ? (uint32_t)strtoul(end + 1, NULL, 16) : 1);
+    }
+#endif
+    int why = setjmp(c.stop);
+    if (why == 0) {
+        dispatch(&c, entry, 0);
+        fprintf(stderr, "war: entry point returned\n");
+        return 0;
+    }
+    if (why == STOP_EXIT) return (int)c.fault_addr;
+    const char *names[] = {"ok", "memory fault", "budget", "divide error", "bad return", "trap", "exit"};
+    fprintf(stderr, "war: stopped (%s) at %x\n  eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n",
+            names[why], c.fault_addr, c.r[EAX], c.r[ECX], c.r[EDX], c.r[EBX], c.r[ESP], c.r[EBP], c.r[ESI], c.r[EDI]);
+    if (why == STOP_BADRET)
+        fprintf(stderr, "  call at %x expected return to %x, got %x\n", c.bad_call, c.bad_expect, c.ret_to);
+    fprintf(stderr, "  stack at last call:");
+    for (int k = 0; k < 8 && c.r[ESP] + 4 * k + 4 <= MEM_SIZE; k++) fprintf(stderr, " %08x", rd32(&c, c.r[ESP] + 4 * k));
+    fprintf(stderr, "\n");
+#ifdef RECOMP_TRACE
+    print_stack(&c);
+    fprintf(stderr, "  recently entered:");
+    for (uint32_t k = 0; k < 24 && k < c.trail_pos; k++) fprintf(stderr, " %x", c.trail[(c.trail_pos - 1 - k) & 63]);
+    fprintf(stderr, "\n");
+#endif
+    return 1;
+}

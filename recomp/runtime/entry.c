@@ -15,6 +15,7 @@ int lifted_run(uint32_t addr, uint32_t *regs, uint8_t *mem, uint32_t mem_size,
     if (!e->fn) return -1;
 
     Cpu c;
+    memset(&c, 0, sizeof c);        /* flat segments, no hooks */
     memcpy(c.r, regs, sizeof c.r);
     c.mem = mem;
     c.mem_size = mem_size;
