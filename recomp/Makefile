@@ -1,6 +1,7 @@
 # Native arm64 build of the lifted code and the intro-frame viewer.
 #
 #   make play       build and run the game (build/war)
+#   make wasm       browser build in build/web (Emscripten); make serve to play it
 #   make            build/war and build/blitview
 #   make frames     work/demo/intro.wcf from captures in work/frames
 #   make check      decode every frame natively and verify against DOSBox-X
@@ -21,7 +22,7 @@ WAREXE  := work/exe/war.exe
 LIFTED  := build/lifted_rt.c
 FRAMES  := work/demo/intro.wcf
 
-.PHONY: all frames check run clean war play
+.PHONY: all frames check run clean war play wasm serve wasm-test
 
 all: build/blitview build/war
 
@@ -51,6 +52,42 @@ work/game/WAR.EXE: $(WAREXE)
 play: build/war work/game/WAR.EXE
 	./build/war work/game $(IMAGE)
 
+# ---- the same game for the browser: Emscripten, game loop in a Web Worker ----
+# build/web/war.data packs the local game folder; it is build output, never published.
+EMCC       ?= emcc
+WEB_CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
+WEB_LDFLAGS := -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=96MB -sSTACK_SIZE=8MB -sEXIT_RUNTIME=1 \
+               --pre-js web/env.js
+WEB_FILES  := build/web/index.html build/web/worker.js
+
+build/web/game.o: $(GAME_C) runtime/x86.h
+	@mkdir -p build/web
+	$(EMCC) $(WEB_CFLAGS) -Iruntime -c $(GAME_C) -o $@
+
+build/web/war.js: runtime/game.c runtime/x86.h web/env.js build/web/game.o $(IMAGE) work/game/WAR.EXE
+	$(EMCC) $(WEB_CFLAGS) -Iruntime runtime/game.c build/web/game.o $(WEB_LDFLAGS) -sENVIRONMENT=worker \
+	  --preload-file work/game@/game --preload-file $(IMAGE)@/image.bin -o $@
+
+build/web/%: web/%
+	@mkdir -p build/web
+	cp $< $@
+
+wasm: build/web/war.js $(WEB_FILES)
+
+serve: wasm
+	$(PYTHON) tools/serve.py build/web
+
+# The same wasm under Node with the real file system: headless runs with
+# WAR_INPUT/WAR_SNAPSHOT, like build/war.  make wasm-test boots into the first
+# mission and moves a grunt (select, Move button, destination).
+build/web/war-node.js: runtime/game.c runtime/x86.h web/env.js build/web/game.o
+	$(EMCC) $(WEB_CFLAGS) -Iruntime runtime/game.c build/web/game.o $(WEB_LDFLAGS) -sENVIRONMENT=node -sNODERAWFS=1 -o $@
+
+BOOT_INPUT := 6:esc,8:return,10:return,12:return,15:click@160,100,18:space,21:return,25:click@130,130,27.5:click@18,127,29.5:click@200,150,33:snap
+
+wasm-test: build/web/war-node.js $(IMAGE) work/game/WAR.EXE
+	WAR_INPUT="$(BOOT_INPUT)" WAR_SNAPSHOT=34 node build/web/war-node.js work/game $(IMAGE)
+
 $(LIFTED): $(WAREXE) tools/lift.py tools/disasm.py tools/le.py
 	@mkdir -p build
 	$(PYTHON) tools/lift.py $@ --all-leaf --bases $(BASES)
@@ -74,3 +111,4 @@ run: build/blitview $(FRAMES)
 
 clean:
 	rm -f build/blitview $(LIFTED) build/war build/game.o $(GAME_C) $(IMAGE)
+	rm -rf build/web

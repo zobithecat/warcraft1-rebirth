@@ -9,8 +9,16 @@
  *
  *   war [GAME_DIR [IMAGE]]      defaults: work/game build/image.bin
  *   WAR_TRACE=1 war ...         log every interrupt
+ *
+ * Built with Emscripten (make wasm) the same code runs in a browser Web
+ * Worker: the game loop never yields, so frames go out by postMessage and
+ * input comes back through a SharedArrayBuffer ring (web/worker.js).
  */
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#else
 #include <SDL.h>
+#endif
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -67,9 +75,12 @@ typedef struct {
     uint8_t dac[768];
     int dac_w, dac_wc, dac_r, dac_rc;
     uint32_t retrace;
+    int video_on;
+#ifndef __EMSCRIPTEN__
     SDL_Window *win;
     SDL_Renderer *ren;
     SDL_Texture *tex;
+#endif
     uint64_t last_present;
     /* input */
     uint8_t keys[64];
@@ -86,6 +97,13 @@ typedef struct {
 } Host;
 
 static Host H;
+
+static uint64_t now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+static uint64_t now_ms(void) { return (now_ns() - H.start_ns) / 1000000ull; }
 
 static void die(Cpu *c, const char *fmt, ...) {
     va_list ap;
@@ -150,8 +168,33 @@ static void call_guest(Cpu *c, uint32_t handler, int iret_frame) {
 }
 
 /* ---- video ------------------------------------------------------------------- */
+#ifdef __EMSCRIPTEN__
+/* worker.js: send a 320x200 RGBA frame to the page */
+EM_JS(void, web_present, (const uint32_t *px), {
+    if (typeof postMessage !== "function") return;
+    const f = HEAPU8.slice(px, px + 320 * 200 * 4);
+    postMessage({ frame: f.buffer }, [f.buffer]);
+});
+/* worker.js: next input event from the page's ring, as {type, a, b, c} */
+EM_JS(int, web_poll, (int32_t *ev), {
+    const r = globalThis.warRing;
+    if (!r) return 0;
+    const tail = Atomics.load(r, 1);
+    if (Atomics.load(r, 0) === tail) return 0;
+    const at = 2 + (tail & 255) * 4;
+    for (let i = 0; i < 4; i++) HEAP32[(ev >> 2) + i] = r[at + i];
+    Atomics.store(r, 1, tail + 1);
+    return 1;
+});
+#define PIXEL(r, g, b) (0xFF000000u | (uint32_t)(b) << 16 | (uint32_t)(g) << 8 | (uint32_t)(r))   /* RGBA bytes */
+
+static void video_init(void) { H.video_on = 1; }
+#else
+#define PIXEL(r, g, b) (0xFF000000u | (uint32_t)(r) << 16 | (uint32_t)(g) << 8 | (uint32_t)(b))   /* ARGB8888 */
+
 static void video_init(void) {
-    if (H.win) return;
+    if (H.video_on) return;
+    H.video_on = 1;
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); exit(1); }
     H.win = SDL_CreateWindow("WarCraft (native arm64)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                              320 * SCALE, 200 * SCALE, SDL_WINDOW_ALLOW_HIGHDPI);
@@ -159,25 +202,30 @@ static void video_init(void) {
     H.tex = SDL_CreateTexture(H.ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 320, 200);
     SDL_ShowCursor(SDL_DISABLE);
 }
+#endif
 
 static void present(Cpu *c) {
-    if (!H.win) return;
+    if (!H.video_on) return;
     static uint32_t px[320 * 200];
     uint32_t lut[256];
     for (int i = 0; i < 256; i++) {
         const uint8_t *d = H.dac + i * 3;
-        lut[i] = 0xFF000000u | (uint32_t)(d[0] * 255 / 63) << 16 | (uint32_t)(d[1] * 255 / 63) << 8 |
-                 (uint32_t)(d[2] * 255 / 63);
+        lut[i] = PIXEL(d[0] * 255 / 63, d[1] * 255 / 63, d[2] * 255 / 63);
     }
     const uint8_t *vram = G(c, VGA_BASE);
     for (int i = 0; i < 320 * 200; i++) px[i] = lut[vram[i]];
+#ifdef __EMSCRIPTEN__
+    web_present(px);
+#else
     SDL_UpdateTexture(H.tex, NULL, px, 320 * 4);
     SDL_RenderClear(H.ren);
     SDL_RenderCopy(H.ren, H.tex, NULL, NULL);
     SDL_RenderPresent(H.ren);
+#endif
 }
 
 /* ---- input -------------------------------------------------------------------- */
+#ifndef __EMSCRIPTEN__
 static uint8_t pc_scancode(SDL_Scancode s) {
     switch (s) {
     case SDL_SCANCODE_ESCAPE: return 0x01;
@@ -213,6 +261,7 @@ static uint8_t pc_scancode(SDL_Scancode s) {
     default: return 0;
     }
 }
+#endif
 
 static void key_event(Cpu *c, uint8_t scan) {
     H.last_scan = scan;
@@ -232,8 +281,73 @@ static void mouse_event(Cpu *c, uint32_t mask) {
     memcpy(c->r, save, sizeof save);
 }
 
+/* Pointer at (fx, fy) in 1/65536ths of the window; button: 0 = move, 1/2/4 = left/right/middle. */
+static void mouse_input(Cpu *c, uint32_t fx, uint32_t fy, int button, int down) {
+    int span_x = H.mx_max - H.mx_min, span_y = H.my_max - H.my_min;
+    H.mouse_x = H.mx_min + (int)((uint64_t)fx * (uint32_t)(span_x + 1) >> 16);
+    H.mouse_y = H.my_min + (int)((uint64_t)fy * (uint32_t)(span_y + 1) >> 16);
+    if (H.mouse_x > H.mx_max) H.mouse_x = H.mx_max;
+    if (H.mouse_y > H.my_max) H.mouse_y = H.my_max;
+    uint32_t mask = 1;
+    if (button) {
+        if (down) { H.mouse_buttons |= button; mask = button == 1 ? 2 : button == 2 ? 8 : 32; }
+        else { H.mouse_buttons &= ~button; mask = button == 1 ? 4 : button == 2 ? 16 : 64; }
+    }
+    mouse_event(c, mask);
+}
+
+/* Input from the window (or the page) in one form for both builds. */
+typedef struct {
+    int32_t type;          /* 1: key, a = PC scancode (| 0x80 released); 2: mouse; 3: quit */
+    int32_t a, b, c;       /* mouse: a, b = position as in mouse_input, c = button | down << 3 */
+} InputEvent;
+
+/* The game queues a button event with the cursor position it last drew
+ * (0x617ea), not the one the mouse driver just reported, and acts on the
+ * queue once per game cycle.  A press needs the cursor already in place, and
+ * a press and release inside one cycle do not register: releases are held
+ * back until the button has been down MIN_CLICK_MS.  Scripted clicks move
+ * first and press MIN_CLICK_MS later, like a hand on a real mouse. */
+#define MIN_CLICK_MS 100
+#define MAX_TIMED 8
+static struct { InputEvent ev; uint64_t due; } timed[MAX_TIMED];   /* in due order */
+static int timed_len;
+static uint64_t pressed_at[8];
+
+static void defer_input(InputEvent ev, uint64_t due) {
+    if (timed_len < MAX_TIMED) { timed[timed_len].ev = ev; timed[timed_len].due = due; timed_len++; }
+}
+
+static void handle_input(Cpu *c, const InputEvent *ev, uint64_t now) {
+    if (ev->type == 1) key_event(c, (uint8_t)ev->a);
+    else if (ev->type == 3) x86_stop(c, STOP_EXIT, 0);
+    else if (ev->type == 2) {
+        int button = ev->c & 7, down = ev->c >> 3 & 1;
+        if (button && down) pressed_at[button] = now;
+        mouse_input(c, (uint32_t)ev->a, (uint32_t)ev->b, button, down);
+    }
+}
+
+/* Feed input to the game in order; anything behind an event that is not due yet stays queued. */
+static void feed_input(Cpu *c, uint64_t now, int (*next)(InputEvent *)) {
+    InputEvent ev;
+    for (;;) {
+        if (timed_len) {
+            if (now < timed[0].due) return;
+            ev = timed[0].ev;
+            memmove(timed, timed + 1, (size_t)--timed_len * sizeof timed[0]);
+        } else if (!next(&ev)) {
+            return;
+        } else if (ev.type == 2 && (ev.c & 7) && !(ev.c & 8) && now < pressed_at[ev.c & 7] + MIN_CLICK_MS) {
+            defer_input(ev, pressed_at[ev.c & 7] + MIN_CLICK_MS);
+            return;
+        }
+        handle_input(c, &ev, now);
+    }
+}
+
 /* Scripted input for unattended runs: WAR_INPUT="5:esc,9:return,12:click@160,100,20:snap"
- * (seconds since start; keys by name, mouse clicks in 320x200 coordinates). */
+ * (seconds since start; keys by name, left/right clicks (click@, rclick@) in 320x200 coordinates). */
 typedef struct { uint64_t ms; char what[32]; } ScriptStep;
 static ScriptStep script[64];
 static int script_len, script_pos;
@@ -248,7 +362,7 @@ static void parse_script(const char *s) {
         while (end && end[1] >= '0' && end[1] <= '9' && strchr(end + 1, ':') == NULL) end = strchr(end + 1, ',');
         size_t n = end ? (size_t)(end - colon - 1) : strlen(colon + 1);
         /* click@x,y contains a comma: take it whole */
-        if (strncmp(colon + 1, "click@", 6) == 0) {
+        if (strncmp(colon + 1, "click@", 6) == 0 || strncmp(colon + 1, "rclick@", 7) == 0) {
             const char *c2 = strchr(colon + 1, ',');
             end = c2 ? strchr(c2 + 1, ',') : NULL;
             n = end ? (size_t)(end - colon - 1) : strlen(colon + 1);
@@ -259,8 +373,6 @@ static void parse_script(const char *s) {
 }
 
 static void snapshot(Cpu *c, const char *path);
-static void key_event(Cpu *c, uint8_t scan);
-static void mouse_event(Cpu *c, uint32_t mask);
 
 static void run_script(Cpu *c, uint64_t now) {
     static const struct { const char *name; uint8_t scan; } keys[] = {
@@ -275,14 +387,15 @@ static void run_script(Cpu *c, uint64_t now) {
             snprintf(path, sizeof path, "build/screen_%llu.ppm", (unsigned long long)(now / 1000));
             snapshot(c, path);
             fprintf(stderr, "war: saved %s\n", path);
-        } else if (strncmp(w, "click@", 6) == 0) {
-            int x = 0, y = 0;
-            sscanf(w + 6, "%d,%d", &x, &y);
-            H.mouse_x = H.mx_min + x * (H.mx_max - H.mx_min + 1) / 320;
-            H.mouse_y = H.my_min + y * (H.my_max - H.my_min + 1) / 200;
-            mouse_event(c, 1);
-            H.mouse_buttons |= 1; mouse_event(c, 2);
-            H.mouse_buttons &= ~1; mouse_event(c, 4);
+        } else if (strncmp(w, "click@", 6) == 0 || strncmp(w, "rclick@", 7) == 0) {
+            int x = 0, y = 0, button = w[0] == 'r' ? 2 : 1;
+            sscanf(strchr(w, '@') + 1, "%d,%d", &x, &y);
+            InputEvent ev = { 2, x * 65536 / 320, y * 65536 / 200, 0 };
+            defer_input(ev, now);
+            ev.c = button | 8;
+            defer_input(ev, now + MIN_CLICK_MS);
+            ev.c = button;
+            defer_input(ev, now + 2 * MIN_CLICK_MS);
         } else if (strcmp(w, "quit") == 0) {
             x86_stop(c, STOP_EXIT, 0);
         } else {
@@ -305,9 +418,46 @@ static void snapshot(Cpu *c, const char *path) {
     fclose(f);
 }
 
+#ifdef __EMSCRIPTEN__
+static int next_input(InputEvent *ev) { return web_poll(&ev->type); }
+#else
+static int next_input(InputEvent *ev) {
+    SDL_Event e;
+    while (SDL_PollEvent(&e)) {
+        switch (e.type) {
+        case SDL_QUIT:
+            *ev = (InputEvent){ 3, 0, 0, 0 };
+            return 1;
+        case SDL_KEYDOWN: case SDL_KEYUP: {
+            if (e.key.repeat) break;
+            uint8_t s = pc_scancode(e.key.keysym.scancode);
+            if (!s) break;
+            *ev = (InputEvent){ 1, e.type == SDL_KEYUP ? s | 0x80 : s, 0, 0 };
+            return 1;
+        }
+        case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
+            int wx, wy, ww, wh;
+            SDL_GetMouseState(&wx, &wy);
+            SDL_GetWindowSize(H.win, &ww, &wh);
+            if (wx < 0) wx = 0;
+            if (wy < 0) wy = 0;
+            uint32_t fx = ww ? (uint32_t)((uint64_t)wx * 65536 / (uint32_t)ww) : 0;
+            uint32_t fy = wh ? (uint32_t)((uint64_t)wy * 65536 / (uint32_t)wh) : 0;
+            int bit = 0;
+            if (e.type != SDL_MOUSEMOTION)
+                bit = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_RIGHT ? 2 : 4;
+            *ev = (InputEvent){ 2, (int32_t)fx, (int32_t)fy, bit | (e.type == SDL_MOUSEBUTTONDOWN) << 3 };
+            return 1;
+        }
+        }
+    }
+    return 0;
+}
+#endif
+
 /* Window events -> game; redraw at most ~60 times a second. */
 static void pump(Cpu *c) {
-    uint64_t now = SDL_GetTicks64();
+    uint64_t now = now_ms();
     if (now - H.last_present < 16) return;
     H.last_present = now;
     run_script(c, now);
@@ -317,38 +467,7 @@ static void pump(Cpu *c) {
         x86_stop(c, STOP_EXIT, 0);
     }
     present(c);
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        switch (e.type) {
-        case SDL_QUIT:
-            x86_stop(c, STOP_EXIT, 0);
-            break;
-        case SDL_KEYDOWN: case SDL_KEYUP: {
-            if (e.key.repeat) break;
-            uint8_t s = pc_scancode(e.key.keysym.scancode);
-            if (s) key_event(c, e.type == SDL_KEYUP ? (uint8_t)(s | 0x80) : s);
-            break;
-        }
-        case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
-            int wx, wy, ww, wh;
-            SDL_GetMouseState(&wx, &wy);
-            SDL_GetWindowSize(H.win, &ww, &wh);
-            int span_x = H.mx_max - H.mx_min, span_y = H.my_max - H.my_min;
-            H.mouse_x = H.mx_min + (ww ? wx * (span_x + 1) / ww : 0);
-            H.mouse_y = H.my_min + (wh ? wy * (span_y + 1) / wh : 0);
-            if (H.mouse_x > H.mx_max) H.mouse_x = H.mx_max;
-            if (H.mouse_y > H.my_max) H.mouse_y = H.my_max;
-            uint32_t mask = 1;
-            if (e.type != SDL_MOUSEMOTION) {
-                int bit = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_RIGHT ? 2 : 4;
-                if (e.type == SDL_MOUSEBUTTONDOWN) { H.mouse_buttons |= bit; mask = bit == 1 ? 2 : bit == 2 ? 8 : 32; }
-                else { H.mouse_buttons &= ~bit; mask = bit == 1 ? 4 : bit == 2 ? 16 : 64; }
-            }
-            mouse_event(c, mask);
-            break;
-        }
-        }
-    }
+    feed_input(c, now, next_input);
 }
 
 /* ---- files -------------------------------------------------------------------- */
@@ -423,7 +542,7 @@ static void int21(Cpu *c, uint32_t at) {
     }
     case 0x2C: {                                   /* time: the game's clock() */
         pump(c);
-        uint64_t cs = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - H.start_ns) / 10000000ull + 12ull * 360000;
+        uint64_t cs = (now_ns() - H.start_ns) / 10000000ull + 12ull * 360000;
         uint32_t day = (uint32_t)(cs % 8640000ull);
         set16(c, ECX, (day / 360000) << 8 | (day / 6000) % 60);
         set16(c, EDX, ((day / 100) % 60) << 8 | day % 100);
@@ -795,7 +914,7 @@ int main(int argc, char *argv[]) {
     H.trace = getenv("WAR_TRACE") != NULL;
     if (getenv("WAR_SNAPSHOT")) H.snapshot_ms = (uint64_t)(atof(getenv("WAR_SNAPSHOT")) * 1000);
     parse_script(getenv("WAR_INPUT"));
-    H.start_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    H.start_ns = now_ns();
     H.mx_max = 639; H.my_max = 199;
     H.drive = 2;
 

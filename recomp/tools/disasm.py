@@ -308,4 +308,14 @@ def build(mod: LEModule) -> Disasm:
         d.run(extra)
         if len(d.insns) == before:
             break
+    # An immediate pointing at code that was already decoded (as a jump
+    # target, or by fall-through) is still a function pointer: the game keeps
+    # handlers in pointer slots (`mov [0x5921c], 0x2885c`) and calls them
+    # indirectly, some of them a lone `ret` shared with another function.
+    for f in mod.fixups:
+        t = mod.fixup_target(f)
+        refs = d.code_refs.get(t)
+        if (f.tgt_obj == code.index and t in d.insns and t not in d.func_starts and refs
+                and all(kind == "imm" for _, kind in refs)):
+            d.func_starts.add(t)
     return d
