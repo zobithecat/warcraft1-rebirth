@@ -31,9 +31,14 @@ make serve        # build/web을 만들고 http://localhost:8000/ 에서 서비�
   게임은 Web Worker(`web/worker.js`)에서 돌고, 화면은 `postMessage`로, 입력은 `SharedArrayBuffer` 링으로 주고받습니다.
   `SharedArrayBuffer`에는 COOP/COEP 헤더가 필요해 `tools/serve.py`로 서비스해야 합니다.
 - 게임 데이터(`work/game`, 약 70MB)는 `build/web/war.data`로 묶여 같은 서버에서 읽힙니다. 이 파일은 빌드 산출물이며
-  저작권이 있는 원본 데이터이므로 공개 서버에 올리지 마세요.
+  저작권이 있는 원본 데이터이므로 공개 서버에 올리지 마세요(`make deploy`가 비밀번호를 거는 이유).
 - 저장 파일은 브라우저 메모리에만 있고 새로고침하면 사라집니다.
 - URL 파라미터가 환경 변수가 됩니다: `?input=6:esc,8:return` → `WAR_INPUT`, `?trace=1` → `WAR_TRACE`.
+- `make deploy`: `build/web`을 AWS에 올립니다(AWS CLI의 현재 자격 증명·리전 사용, `tools/deploy_aws.py`).
+  모든 공개 접근을 막은 S3 버킷 ← CloudFront(Origin Access Control). CloudFront Function이 HTTP 기본 인증을 검사하고,
+  응답 헤더 정책이 COOP/COEP를 붙입니다(S3 정적 웹사이트 호스팅만으로는 이 헤더를 붙일 수 없음). `war.data`는 gzip으로 올려 74MB → 49MB.
+  주소·사용자·비밀번호와 리소스 ID는 `work/deploy.json`(git 제외)에 저장되고, 다시 실행하면 파일만 올리고 캐시를 무효화합니다.
+  비밀번호 교체는 `python3 tools/deploy_aws.py --new-password`.
 - `make wasm-test`: 같은 wasm을 Node.js에서 창 없이 실행(`build/web/war-node.js`, 실제 파일 시스템 사용).
   네이티브와 같은 입력 스크립트를 주면 화면이 픽셀 단위로 같은지 비교할 수 있습니다.
 
