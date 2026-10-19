@@ -191,7 +191,7 @@ setup.exe는 86.3%인데, 나머지는 죽은 라이브러리 코드, 코드 안
 1. ~~키보드·타이머 ISR 경로 확정~~ → 완료 ("플랫폼 훅 상세")
 2. ~~AIL API 경계 식별~~ → 완료. 대체 경계는 AIL API가 아니라 Blizzard 사운드 래퍼
 3. ~~리프터 프로토타입~~ → 게임 리프 함수 199개 변환, Unicorn 기준 차등 테스트 불일치 0 ([LIFTER.md](LIFTER.md)).
-   DOSBox-X 실제 상태 캡처는 계획만 있음
+   DOSBox-X 실제 상태 캡처 23건(함수 15개)도 DOSBox·Unicorn·arm64 세 방향 일치
 4. **사운드 래퍼 14개 진입점의 인자·동작 정리**: 대체 구현의 명세. 효과음 슬롯 구조체(`0x59F30`), 음악 핸들(`0x59F5C`)부터
 
 ## 재현
@@ -216,4 +216,5 @@ python3 recomp/tools/test_platform_map.py  # 손으로 확인한 사실과 대�
 | `tools/platform_map.py` | 함수 단위 상수 전파로 `int`/`int386`/`intdos`/`inp`/`outp` 인자 해석, 벡터 설치 표, 사운드 경계 |
 | `tools/test_platform_map.py` | `platform_map.py` 회귀 테스트 |
 | `tools/lift.py`, `tools/difftest.py`, `tools/alutest.py`, `runtime/` | 리프터 프로토타입과 차등 테스트 ([LIFTER.md](LIFTER.md)) |
+| `tools/capture.py`, `tools/dbx.py`, `tools/replay.py`, `capture/` | DOSBox-X 상태 캡처와 재생 ([LIFTER.md](LIFTER.md)) |
 | `tools/extract.py` | CD 이미지에서 실행 파일 추출 |

@@ -61,8 +61,11 @@ class Fixup:
 
 
 class LEModule:
-    def __init__(self, raw: bytes):
+    def __init__(self, raw: bytes, bases: dict[int, int] | None = None):
+        """`bases` overrides object load addresses ({object index: base}), e.g.
+        to reproduce where DOS/4GW actually placed them at run time."""
         self.raw = raw
+        self.bases = bases or {}
         if raw[:2] != b"MZ":
             raise ValueError("not an MZ executable")
         self.le_off = struct.unpack_from("<I", raw, 0x3C)[0]
@@ -99,7 +102,7 @@ class LEModule:
         base = self.le_off + self.obj_table_off
         for i in range(self.obj_count):
             vsize, rbase, flags, pidx, pcnt, _ = struct.unpack_from("<6I", self.raw, base + i * 24)
-            self.objects.append(Obj(i + 1, vsize, rbase, flags, pidx, pcnt))
+            self.objects.append(Obj(i + 1, vsize, self.bases.get(i + 1, rbase), flags, pidx, pcnt))
 
     def _page_file_offset(self, page: int) -> tuple[int, int]:
         """Return (file offset, size) of 1-based logical page `page`."""

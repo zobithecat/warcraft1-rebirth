@@ -7,8 +7,9 @@ C locals, flags in a local Flags struct, and guest memory through rd*/wr*
 gotos.  A function is only emitted when every instruction in it is supported;
 otherwise the reason is reported and the function is skipped.
 
-Usage: lift.py OUT.c [ADDR ...]     (hex addresses; default: the prototype set)
+Usage: lift.py OUT.c [ADDR ...]     (hex image addresses; default: the prototype set)
        lift.py OUT.c --all-leaf     (every game-region leaf function)
+       ... --bases 1=0x1CB000,2=0x1FD000   (lift for the objects' run-time load addresses)
 """
 from __future__ import annotations
 
@@ -411,10 +412,11 @@ def lift_functions(d: disasm.Disasm, roots: list[int]) -> tuple[dict[int, str], 
     return done, skipped
 
 
-def leaf_game_functions(d: disasm.Disasm) -> list[int]:
+def leaf_game_functions(d: disasm.Disasm, delta: int = 0) -> list[int]:
+    """Leaf functions below the game/platform split (`delta`: code relocation)."""
     out = []
     for f in sorted(d.func_starts):
-        if f >= analyze.REGION_SPLIT:
+        if f >= analyze.REGION_SPLIT + delta:
             continue
         try:
             fn = collect(d, f)
@@ -439,14 +441,30 @@ def write_c(path: pathlib.Path, funcs: dict[int, str]) -> None:
     )
 
 
+def parse_bases(spec: str) -> dict[int, int]:
+    """"1=0x1CB000,2=0x1FD000" -> {1: 0x1CB000, 2: 0x1FD000}"""
+    return {int(k): int(v, 0) for k, v in (kv.split("=") for kv in spec.split(","))}
+
+
 def main() -> None:
     out = pathlib.Path(sys.argv[1])
     args = sys.argv[2:]
-    d = disasm.build(LEModule(DEFAULT_EXE.read_bytes()))
+    bases = {}
+    if "--bases" in args:
+        i = args.index("--bases")
+        bases = parse_bases(args[i + 1])
+        del args[i:i + 2]
+    raw = DEFAULT_EXE.read_bytes()
+    mod = LEModule(raw, bases)
+    code = next(o for o in mod.objects if o.is_code)
+    # Addresses on the command line are image addresses; shift them to where
+    # the code object was loaded.
+    delta = code.base - next(o for o in LEModule(raw).objects if o.is_code).base
+    d = disasm.build(mod)
     if args == ["--all-leaf"]:
-        roots = leaf_game_functions(d)
+        roots = leaf_game_functions(d, delta)
     else:
-        roots = [int(a, 16) for a in args] or PROTOTYPE
+        roots = [int(a, 16) + delta for a in args] or [a + delta for a in PROTOTYPE]
     done, skipped = lift_functions(d, roots)
     write_c(out, done)
     print(f"lifted {len(done)} functions -> {out}")
