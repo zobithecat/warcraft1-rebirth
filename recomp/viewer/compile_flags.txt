@@ -1,0 +1,5 @@
+-Iruntime
+-I/opt/homebrew/include/SDL2
+-D_THREAD_SAFE
+-arch
+arm64

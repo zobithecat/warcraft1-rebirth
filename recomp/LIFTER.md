@@ -148,6 +148,31 @@ tools/alutest.py:   ALU 헬퍼 vs Unicorn 명령어 단위 비교 (결과 + 정�
 - 캡처는 진입 시점과 복귀 시점 사이 DOSBox의 모든 변화를 함수 탓으로 보지 않도록 분리하지만,
   ISR이 **함수가 쓴 바로 그 주소**를 같은 구간에 덮어쓰면 오탐(FAIL)이 날 수 있습니다(지금까지는 없음).
 
+## 네이티브 뷰어 (`build/blitview`)
+
+리프팅된 게임 코드를 **Python 없이** 실행하는 arm64 실행 파일입니다. DOSBox-X에서 캡처한 인트로 키 프레임들을
+원본 게임의 RLE 블리터(`0x1025C`, 리프팅 후 네이티브)로 직접 디코딩해 SDL2 창에 재생하고,
+프레임마다 DOSBox-X 결과와 같은지 창 제목에 표시합니다.
+
+```bash
+cd recomp
+make            # build/blitview (리프팅된 C 생성 + clang arm64 링크)
+make frames     # work/frames 캡처 → work/demo/intro.wcf (프레임 묶음)
+make run        # 창 띄우기: Space 일시정지, ←/→ 한 프레임씩, Esc 종료
+make check      # 창 없이 모든 프레임 디코딩·검증·시간 측정
+```
+
+- 프레임 묶음은 `tools/capture.py --capdir work/frames --per-func 40 1025c`로 캡처한 뒤 `make frames`로 만듭니다.
+  `pack_frames.py`가 Unicorn 메모리 훅으로 블리터가 실제로 읽고 쓰는 바이트만 골라 담으므로, 프레임당 약 130KB입니다(캡처 원본은 32MB).
+- 뷰어는 프레임마다 게스트 메모리(원본 RLE, 호출 전 버퍼, 스택의 복귀 주소)를 다시 만들고, 리프팅된 함수를 호출한 뒤
+  버퍼와 레지스터를 DOSBox-X 결과와 비교합니다.
+- 결과: 인트로 키 프레임 **11개**(320×144 장면 10개, 320×200 화면 1개)가 모두 **DOSBox-X와 픽셀·레지스터까지 동일**,
+  네이티브 디코딩은 프레임당 평균 약 50µs입니다(`make check`).
+- 팔레트는 동영상의 팔레트 청크(`0x58C30`)를 호출 **후** 덤프에서 읽습니다. 호출 시점의 DAC 사본(`0x61F80`)에는
+  아직 이전 장면의 팔레트가 들어 있어 장면이 바뀌는 프레임의 색이 틀립니다.
+- 필요한 것: SDL2(`brew install sdl2`). 실행 파일은 SDL2와 시스템 라이브러리에만 링크됩니다.
+- 게임 데이터에서 나온 파일(`build/lifted_rt.c`, `work/`)은 저장소에 넣지 않습니다.
+
 ## 실행
 
 ```bash

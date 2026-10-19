@@ -189,6 +189,7 @@ def main() -> None:
     ap.add_argument("--per-func", type=int, default=3)
     ap.add_argument("--time", type=float, default=90, help="seconds to run the game per batch")
     ap.add_argument("--clean", action="store_true", help="delete earlier captures first")
+    ap.add_argument("--capdir", help="write captures here instead of work/capture")
     ap.add_argument("--from-lifted", metavar="LIFTED_C",
                     help="target every function in a lift.py output (image-address build)")
     ap.add_argument("addrs", nargs="*")
@@ -199,6 +200,9 @@ def main() -> None:
     if not args.addrs:
         ap.error("no target functions")
 
+    global CAP
+    if args.capdir:
+        CAP = pathlib.Path(args.capdir).resolve()
     if args.clean and CAP.is_dir():
         for f in CAP.iterdir():
             if f.suffix.lower() in (".json", ".bin"):
