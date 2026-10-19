@@ -1,0 +1,14 @@
+# Only the recompilation project is tracked.  The original game archive
+# (CD image, box scans, archive.org metadata) stays local: it is large and
+# copyrighted.
+/*
+!/.gitignore
+!/recomp/
+
+# Generated from the game files / by the build; never commit.
+/recomp/work/
+/recomp/build/
+
+__pycache__/
+.DS_Store
+.omc/
