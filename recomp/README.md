@@ -1,5 +1,7 @@
 # WarCraft: Orcs & Humans (DOS 1.12) — 네이티브 arm64 재컴파일
 
+> 비상업 개인 연구용입니다. 게임 파일은 포함하지 않으며 직접 가진 원본이 필요합니다. 라이선스와 주의 사항: [../README.md](../README.md)
+
 원본 `WAR.EXE`(Watcom C/C++32, DOS/4GW)의 x86 기계어를 **함수 1,338개 전부 C로 변환**하고,
 clang으로 **맥 arm64 네이티브 실행 파일**(`build/war`)을, Emscripten으로 **브라우저용 WebAssembly**(`build/web`)를 만듭니다. 에뮬레이터 없이 원본 게임 로직이 그대로 돌고,
 DOS·DOS/4GW·PC 하드웨어가 하던 일은 런타임(`runtime/game.c`)이 대신합니다.

@@ -3,6 +3,8 @@
 # copyrighted.
 /*
 !/.gitignore
+!/LICENSE
+!/README.md
 !/recomp/
 
 # Generated from the game files / by the build; never commit.
