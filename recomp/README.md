@@ -21,6 +21,7 @@ make play
   - 원본에는 이런 조작이 없어서 런타임이 게임 자신의 선택·명령 함수를 불러 구현합니다(아래 "요즘 RTS 조작").
 - 인트로는 ESC로 건너뜁니다. CD 검사는 런타임이 D: 드라이브를 CD-ROM처럼 흉내 내서 통과시킵니다.
 - 설정·저장 파일은 `work/game/`에 생깁니다.
+- 소리: 효과음·음성과 음악(AdLib)이 나옵니다(아래 "소리"). `WAR_MUTE=1`이면 끄고, `SDL_VIDEODRIVER=dummy`(창 없는 실행)에서는 자동으로 꺼집니다.
 
 ### 브라우저 (WebAssembly)
 
@@ -37,6 +38,8 @@ make serve        # build/web을 만들고 http://localhost:8000/ 에서 서비�
 - 게임 데이터(`work/game`, 약 70MB)는 `build/web/war.data`로 묶여 같은 서버에서 읽힙니다. 이 파일은 빌드 산출물이며
   저작권이 있는 원본 데이터이므로 공개 서버에 올리지 마세요(`make deploy`가 비밀번호를 거는 이유).
 - 저장 파일은 브라우저 메모리에만 있고 새로고침하면 사라집니다.
+- 소리는 브라우저 정책 때문에 화면을 처음 클릭(또는 키 입력)할 때 켜집니다. 워커가 만든 소리를 `SharedArrayBuffer` 링으로
+  `web/audio.js`(AudioWorklet)에 넘깁니다.
 - URL 파라미터가 환경 변수가 됩니다: `?input=6:esc,8:return` → `WAR_INPUT`, `?trace=1` → `WAR_TRACE`.
 - `make deploy`: `build/web`을 AWS에 올립니다(AWS CLI의 현재 자격 증명·리전 사용, `tools/deploy_aws.py`).
   모든 공개 접근을 막은 S3 버킷 ← CloudFront(Origin Access Control). CloudFront Function이 HTTP 기본 인증을 검사하고,
@@ -61,7 +64,7 @@ make serve        # build/web을 만들고 http://localhost:8000/ 에서 서비�
 
 아직 확인하지 않았거나 지원하지 않는 것:
 
-- **소리 없음.** 사운드 카드 설정 파일이 없어 게임이 Miles AIL을 소리 없이 초기화합니다. 사운드는 Blizzard 사운드 래퍼(진입점 14개)를 SDL로 대체하는 작업이 남아 있습니다([SCOPING.md](SCOPING.md)).
+- 음악의 보이스 9개가 모자랄 때 어느 음을 끊을지는 원본 드라이버와 다릅니다(비교한 30초 동안 517음 중 오래 끄는 음 3개가 더 일찍 끊김).
 - **네트워크·모뎀 대전 불가.** DPMI 실모드 인터럽트(IPX)를 지원하지 않습니다.
 - **임무를 끝까지 플레이하거나 저장/불러오기, 휴먼 캠페인, 이후 임무는 아직 검증하지 않았습니다.** 실행 중 처리하지 못한 DOS 호출이나 변환되지 않은 명령을 만나면 무엇이었는지 출력하고 멈춥니다.
 - FPU가 없는 386처럼 동작합니다(게임 로직은 정수 연산만 씀).
@@ -75,7 +78,9 @@ make serve        # build/web을 만들고 http://localhost:8000/ 에서 서비�
 | `tools/lift.py --all` | 전체 프로그램 x86 → C 변환 (`build/game.c`, 약 28만 줄) |
 | `tools/mkimage.py` | 재배치된 메모리 이미지 (`build/image.bin`) |
 | `runtime/x86.h` | 게스트 메모리, 플래그, ALU, 런타임 훅 |
-| `runtime/game.c` | DOS/DOS4GW/DPMI/VGA/키보드/마우스 대체 구현, SDL2 창 |
+| `runtime/game.c` | DOS/DOS4GW/DPMI/VGA/키보드/마우스 대체 구현, SDL2 창·오디오, 사운드 래퍼 대체 |
+| `runtime/sound.c` | 효과음 믹서, XMIDI 재생, AIL AdLib 드라이버 동작, OPL2 모델 |
+| `tools/soundtest.c`, `tools/soundcmp.py` | 소리 검증: 곡·레지스터 기록을 WAV로 렌더, DOSBox-X 녹음과 비교 |
 | `tools/ckdiff.py`, `tools/bisect_call.sh` | 디버깅: 함수 진입 상태를 덤프해 Unicorn(원본 x86)과 비교 |
 
 변환 방식과 검증은 [LIFTER.md](LIFTER.md), 바이너리 분석은 [SCOPING.md](SCOPING.md)에 있습니다.
@@ -95,6 +100,34 @@ make serve        # build/web을 만들고 http://localhost:8000/ 에서 서비�
 | (예방) 입력 처리 중 스택 덮어쓰기 가능 | 포트 I/O 훅이 레지스터를 내보내지 않고 ISR을 호출할 수 있음 | 포트 I/O 전후로 레지스터 저장·복원 |
 | Move 목적지를 찍으면 "call to 2885c (no lifted function)" | 함수 포인터 슬롯에 저장되는 핸들러(`mov [0x5921c], 0x2885c` 등 15개)가 이미 다른 경로로 디코딩돼 함수 시작으로 표시되지 않음 | 즉치값으로 주소가 쓰이는 디코딩된 명령은 함수 진입점으로 등록 |
 | 스크립트 클릭이 한 박자 늦게, 엉뚱한 곳에 반영 | 게임은 버튼 이벤트에 콜백 좌표가 아니라 마지막으로 그린 커서 좌표(`0x617ea`)를 기록 | 스크립트 클릭은 이동 → 100ms 뒤 누름 → 100ms 뒤 뗌. 너무 짧은 클릭의 뗌은 100ms까지 보류 |
+
+## 소리
+
+원본은 Blizzard 사운드 래퍼 → Miles AIL 3 → 실모드 사운드 카드 드라이버(.DIG/.MDI)로 소리를 냅니다. 래퍼 함수 15개
+(lift.py `HLE`, 효과음 재생·반복·정지, 음악 등록·시작·정지·페이드, 볼륨 등)를 런타임이 대신하므로 AIL과 DOS 드라이버는 돌지 않고,
+`runtime/sound.c`가 직접 소리를 만듭니다.
+
+- **설정**: 게임은 `config.war`(SETUP.EXE가 씀)가 없으면 소리를 끕니다. 런타임이 Sound Blaster + AdLib으로 된 가상 `config.war`를 줍니다.
+- **효과음·음성**: 게임이 넘기는 WAV/Creative VOC 이미지(8비트 11kHz)를 디코딩해 4채널로 섞습니다(원본처럼 4개, 넘치면 차례로 교체).
+  게임은 "재생 중인 효과음 수"로 음성이 끝나길 기다리므로 재생은 실제 시간에 맞춰 끝납니다.
+- **음악**: 게임의 XMIDI(OPL2용 곡) → AIL의 AdLib 드라이버가 하던 일(게임 음색 은행 `DRIVERS/WARCRAFT.AD`, 9보이스, 타악기는 bank 127,
+  세기 감도 표, 120Hz 틱, FOR/NEXT 반복) → 직접 작성한 OPL2(YM3812) 모델(2연산자 FM, 파형 4종, 매뉴얼 표 기준 엔벌로프, KSL,
+  트레몰로·비브라토, 피드백)을 49716Hz로 돌려 48kHz로 리샘플링.
+
+### 원본과 비교
+
+DOSBox-X로 원본 게임을 실행해(`DX-CAPTURE /A /O WAR.EXE`, `oplemu=nuked`) 인트로 음악을 녹음하고, 원본 AIL 드라이버가 쓴
+OPL 레지스터 기록(.dro)과 비교했습니다(`tools/soundcmp.py`, `tools/soundtest.c`, `make build/soundtest`).
+
+| 비교 | 결과 |
+|---|---|
+| key-on 517개: 음 높이(fnum/block)·음색 레지스터 10개·시각 | 517개 모두 일치(60ms 이내) |
+| 음량 레지스터(0x40) | 515개 일치, 2개 1단위(0.75dB) 차이 |
+| 음 길이(key-on → key-off) | 514개 중 508개 50ms 이내. 다른 6개는 보이스 부족 시 끊는 음 선택 차이 |
+| 원본 레지스터 기록을 우리 OPL로 재생 vs Nuked OPL 녹음 | 스펙트럼 프레임 유사도 0.83, 대역별 균형 차이 ±1dB 이내 |
+| 우리 드라이버 + OPL vs 원본 녹음 | 유사도 0.80, 음량 비 1.02, 대역별 ±1dB(250–500Hz만 -3.6dB) |
+
+음악 음량은 DOSBox-X의 AdLib 믹스 레벨에 맞췄고, 효과음 피크도 같은 녹음의 음성 피크와 비슷합니다.
 
 ## 요즘 RTS 조작
 
@@ -128,4 +161,5 @@ make war GAME_DEFS=-DRECOMP_TRACE
 WAR_DUMP_AT=318a0 ./build/war && python3 tools/ckdiff.py build/dump_318a0.bin
 WAR_WATCH=64ee4,8 ./build/war
 WAR_TRACE=1 ./build/war                # 모든 인터럽트 기록
+WAR_WAV=build/audio.wav ./build/war    # 나온 소리를 WAV로도 저장
 ```

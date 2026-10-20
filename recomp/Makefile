@@ -43,10 +43,17 @@ build/game.o: $(GAME_C) runtime/x86.h
 $(IMAGE): $(WAREXE) tools/mkimage.py tools/le.py
 	$(PYTHON) tools/mkimage.py $@
 
-build/war: runtime/game.c runtime/x86.h build/game.o $(IMAGE)
-	$(CC) $(GAME_CFLAGS) -Iruntime $(SDL_CFLAGS) runtime/game.c build/game.o $(SDL_LIBS) -o $@
+RUNTIME := runtime/game.c runtime/sound.c
+RUNTIME_H := runtime/x86.h runtime/sound.h
+
+build/war: $(RUNTIME) $(RUNTIME_H) build/game.o $(IMAGE)
+	$(CC) $(GAME_CFLAGS) -Iruntime $(SDL_CFLAGS) $(RUNTIME) build/game.o $(SDL_LIBS) -o $@
 
 war: build/war
+
+# Offline sound checks against DOSBox-X (tools/soundtest.c, tools/soundcmp.py)
+build/soundtest: tools/soundtest.c runtime/sound.c runtime/sound.h
+	$(CC) -O2 -Wall -Iruntime -DSOUND_TRACE tools/soundtest.c runtime/sound.c -o $@
 
 work/game/WAR.EXE: $(WAREXE)
 	cd tools && $(PYTHON) -c "import capture; capture.prepare()"
@@ -60,14 +67,14 @@ EMCC       ?= emcc
 WEB_CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter
 WEB_LDFLAGS := -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=96MB -sSTACK_SIZE=8MB -sEXIT_RUNTIME=1 \
                --pre-js web/env.js
-WEB_FILES  := build/web/index.html build/web/worker.js
+WEB_FILES  := build/web/index.html build/web/worker.js build/web/audio.js
 
 build/web/game.o: $(GAME_C) runtime/x86.h
 	@mkdir -p build/web
 	$(EMCC) $(WEB_CFLAGS) -Iruntime -c $(GAME_C) -o $@
 
-build/web/war.js: runtime/game.c runtime/x86.h web/env.js build/web/game.o $(IMAGE) work/game/WAR.EXE
-	$(EMCC) $(WEB_CFLAGS) -Iruntime runtime/game.c build/web/game.o $(WEB_LDFLAGS) -sENVIRONMENT=worker \
+build/web/war.js: $(RUNTIME) $(RUNTIME_H) web/env.js build/web/game.o $(IMAGE) work/game/WAR.EXE
+	$(EMCC) $(WEB_CFLAGS) -Iruntime $(RUNTIME) build/web/game.o $(WEB_LDFLAGS) -sENVIRONMENT=worker \
 	  --preload-file work/game@/game --preload-file $(IMAGE)@/image.bin -o $@
 
 build/web/%: web/%
@@ -88,8 +95,8 @@ hooks:
 # The same wasm under Node with the real file system: headless runs with
 # WAR_INPUT/WAR_SNAPSHOT, like build/war.  make wasm-test boots into the first
 # mission and moves a grunt (select, Move button, destination).
-build/web/war-node.js: runtime/game.c runtime/x86.h web/env.js build/web/game.o
-	$(EMCC) $(WEB_CFLAGS) -Iruntime runtime/game.c build/web/game.o $(WEB_LDFLAGS) -sENVIRONMENT=node -sNODERAWFS=1 -o $@
+build/web/war-node.js: $(RUNTIME) $(RUNTIME_H) web/env.js build/web/game.o
+	$(EMCC) $(WEB_CFLAGS) -Iruntime $(RUNTIME) build/web/game.o $(WEB_LDFLAGS) -sENVIRONMENT=node -sNODERAWFS=1 -o $@
 
 BOOT_INPUT := 6:esc,8:return,10:return,12:return,15:click@160,100,18:space,21:return,25:click@130,130,27.5:click@18,127,29.5:click@200,150,33:snap
 

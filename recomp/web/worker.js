@@ -5,6 +5,7 @@
 self.onmessage = (e) => {
   globalThis.warRing = new Int32Array(e.data.ring);
   globalThis.warEnv = e.data.env;
+  globalThis.warAudio = { buf: new Float32Array(e.data.audioBuf), idx: new Int32Array(e.data.audioIdx) };
   const log = (s) => postMessage({ log: s });
   self.Module = {
     arguments: ["/game", "/image.bin"],

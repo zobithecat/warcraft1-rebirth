@@ -38,6 +38,7 @@ CACHING_OPTIMIZED = "658327ea-f89d-4fab-a63d-7e88639e58f6"   # AWS managed cache
 FILES = {
     "index.html": ("text/html; charset=utf-8", False),
     "worker.js": ("text/javascript", False),
+    "audio.js": ("text/javascript", False),
     "war.js": ("text/javascript", False),
     "war.wasm": ("application/wasm", False),          # CloudFront compresses it (< 10MB)
     "war.data": ("application/octet-stream", True),   # too big for CloudFront compression

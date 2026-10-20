@@ -97,6 +97,25 @@ NO_OPS = {x86.X86_INS_NOP, x86.X86_INS_CLI, x86.X86_INS_STI, x86.X86_INS_WAIT}
 # address of an `int N; ret` stub (0x3CCF6 + 3*N) and "returns" into it, a
 # computed jump through the stack that the lifted code cannot follow.
 HLE = {0x3CC50: "int386 dispatch"}
+# Blizzard's sound wrapper over Miles AIL 3 (SCOPING.md): the runtime plays the
+# effects and the XMIDI music itself, so AIL and its DOS drivers never run.
+HLE.update({
+    0x26370: "sound: start up (effect and music volume)",
+    0x26498: "sound: shut down",
+    0x264BC: "sound: install the music driver",
+    0x26898: "sound: install the digital driver",
+    0x26590: "sound: register an XMIDI file",
+    0x26648: "sound: start the music",
+    0x266E0: "sound: stop the music",
+    0x267BC: "sound: fade out, then stop everything",
+    0x262E4: "sound: play effect n",
+    0x26310: "sound: loop effect n",
+    0x2633C: "sound: stop effect n",
+    0x26B5C: "sound: stop all effects",
+    0x26C84: "sound: digital sound available?",
+    0x26CE8: "sound: effect volume",
+    0x26DC0: "sound: music volume",
+})
 # Functions the runtime may take over call by call: f_<addr> asks the runtime
 # first (x86_wrap; nonzero means it handled the call, `ret` included) and
 # otherwise runs the original code, lifted as f_<addr>_orig.  Used for the

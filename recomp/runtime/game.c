@@ -29,6 +29,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include "sound.h"
 #include "x86.h"
 
 typedef struct { uint32_t addr; void (*fn)(Cpu *); } LiftedEntry;
@@ -730,6 +731,80 @@ static int next_input(InputEvent *ev) {
 }
 #endif
 
+/* ---- audio output -------------------------------------------------------------
+ * sound.c renders as many frames as wall time asks for.  Native builds queue
+ * them on an SDL audio device (none when the window is SDL's dummy driver, or
+ * with WAR_MUTE); the browser build hands them to web/audio.js through a
+ * SharedArrayBuffer ring.  WAR_WAV=file also records them, for checks. */
+#define AUDIO_RATE 48000
+static uint64_t audio_done;                       /* frames rendered so far */
+static FILE *wav_out;
+static uint32_t wav_frames;
+
+#ifdef __EMSCRIPTEN__
+EM_JS(void, web_audio, (const int16_t *pcm, int frames), {
+    const a = globalThis.warAudio;
+    if (!a) return;
+    const cap = a.buf.length / 2, wr = Atomics.load(a.idx, 0), rd = Atomics.load(a.idx, 1);
+    const n = Math.min(frames, cap - (wr - rd));
+    for (let i = 0; i < n; i++) {
+        const j = ((wr + i) % cap) * 2;
+        a.buf[j] = HEAP16[(pcm >> 1) + 2 * i] / 32768;
+        a.buf[j + 1] = HEAP16[(pcm >> 1) + 2 * i + 1] / 32768;
+    }
+    Atomics.store(a.idx, 0, wr + n);
+});
+static void audio_open(void) {}
+static void audio_out(const int16_t *pcm, int frames) { web_audio(pcm, frames); }
+#else
+static SDL_AudioDeviceID audio_dev;
+
+static void audio_open(void) {
+    const char *vd = getenv("SDL_VIDEODRIVER");
+    if (getenv("WAR_MUTE") || (vd && !strcmp(vd, "dummy"))) return;
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) { fprintf(stderr, "war: no audio: %s\n", SDL_GetError()); return; }
+    SDL_AudioSpec want, have;
+    memset(&want, 0, sizeof want);
+    want.freq = AUDIO_RATE;
+    want.format = AUDIO_S16SYS;
+    want.channels = 2;
+    want.samples = 1024;
+    audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (!audio_dev) { fprintf(stderr, "war: no audio device: %s\n", SDL_GetError()); return; }
+    static int16_t lead[2 * AUDIO_RATE / 16];       /* 60 ms of slack against irregular frames */
+    SDL_QueueAudio(audio_dev, lead, sizeof lead);
+    SDL_PauseAudioDevice(audio_dev, 0);
+}
+
+static void audio_out(const int16_t *pcm, int frames) {
+    if (!audio_dev) return;
+    if (SDL_GetQueuedAudioSize(audio_dev) > AUDIO_RATE * 4 / 4) return;   /* over 250 ms behind: drop */
+    SDL_QueueAudio(audio_dev, pcm, (Uint32)frames * 4);
+}
+#endif
+
+static void wav_close(void) {
+    if (!wav_out) return;
+    uint32_t hdr[11] = { 0x46464952, 36 + wav_frames * 4, 0x45564157, 0x20746D66, 16, 0x00020001,
+                         AUDIO_RATE, AUDIO_RATE * 4, 0x00100004, 0x61746164, wav_frames * 4 };
+    fseek(wav_out, 0, SEEK_SET);
+    fwrite(hdr, 4, 11, wav_out);
+    fclose(wav_out);
+    wav_out = NULL;
+}
+
+static void audio_pump(uint64_t now) {
+    static int16_t buf[2 * AUDIO_RATE / 4];
+    uint64_t due = now * AUDIO_RATE / 1000;
+    if (due <= audio_done) return;
+    uint64_t n = due - audio_done;
+    if (n > AUDIO_RATE / 4) { audio_done = due - AUDIO_RATE / 4; n = AUDIO_RATE / 4; }   /* after a stall */
+    snd_render(buf, (int)n);
+    audio_done += n;
+    audio_out(buf, (int)n);
+    if (wav_out) { fwrite(buf, 4, (size_t)n, wav_out); wav_frames += (uint32_t)n; }
+}
+
 /* Window events -> game; redraw at most ~60 times a second. */
 static void pump(Cpu *c) {
     uint64_t now = now_ms();
@@ -742,6 +817,7 @@ static void pump(Cpu *c) {
         x86_stop(c, STOP_EXIT, 0);
     }
     present(c);
+    audio_pump(now);
     feed_input(c, now, next_input);
 }
 
@@ -860,6 +936,14 @@ static void int21(Cpu *c, uint32_t at) {
             /* INSTALL.EXE writes the CD's path here; without it, point at our D: "CD". */
             fp = tmpfile();
             if (fp) { fwrite("D:\\", 1, 4, fp); rewind(fp); }
+        }
+        if (!fp && AH(c) == 0x3D && strcasecmp(strrchr(path, '/') ? strrchr(path, '/') + 1 : path, "config.war") == 0) {
+            /* SETUP.EXE writes the sound card choice here; without it the game
+             * runs silent.  Ours: Sound Blaster (digital) + AdLib (music); the
+             * runtime plays both (sound.c), so the port settings are moot. */
+            static const uint16_t cfg[16] = { 0, 0, 0x220, 7, 1, 0, 0, 0, 0, 0, 0, 0x388, 0, 0, 0, 0 };
+            fp = tmpfile();
+            if (fp) { fwrite(cfg, 1, sizeof cfg, fp); rewind(fp); }
         }
         if (H.trace) fprintf(stderr, "  open %s (%s) -> %s\n", (char *)G(c, c->r[EDX]), path, fp ? "ok" : "fail");
         if (!fp) { fail(c, 2); break; }
@@ -1098,6 +1182,112 @@ static void on_trap(Cpu *c, uint32_t at, const char *what) {
     (void)c;
 }
 
+/* ---- sound: Blizzard's wrapper over Miles AIL, replaced (lift.py HLE) ---------
+ * Watcom register calls (EAX, EDX, ...; result in EAX; other registers kept).
+ * State the wrapper keeps for itself is updated as it would be, so the rest
+ * of the game sees the same values. */
+#define S_DIG_CFG     0x59612u    /* u16 digital driver from config.war, -1 = none */
+#define S_EFFECT_VOL  0x531F4u    /* game option, 0..100 */
+#define S_EFFECTS     0x53200u    /* file image *[]: loaded effects by number */
+#define S_DIG_ON      0x5333Cu    /* u8 */
+#define S_MIDI_ON     0x5333Du    /* u8 */
+#define S_MUSIC_FILE  0x59F54u    /* XMIDI file image */
+#define S_MUSIC_SEQ   0x59F5Cu    /* sequence handle (nonzero = allocated) */
+#define S_DIG_HANDLE  0x59F50u
+#define S_VOL_EFFECTS 0x59F62u    /* u16 0..127 */
+#define S_VOL_MUSIC   0x59F64u
+
+static void hle_return(Cpu *c, uint32_t eax, uint32_t stack_args) {
+    c->r[EAX] = eax;
+    c->ret_to = rd32(c, c->r[ESP]);
+    c->r[ESP] += 4 + stack_args;
+}
+
+static int clamp127(uint32_t v) { int x = (int16_t)v; return x < 0 ? 0 : x > 127 ? 127 : x; }
+
+static void music_start(Cpu *c, int seq) {
+    uint32_t file = rd32(c, S_MUSIC_FILE);
+    if (file && file < MEM_SIZE) snd_music_start(G(c, file), MEM_SIZE - file, seq);
+}
+
+static int effect_allowed(Cpu *c) { return rd16(c, S_DIG_CFG) != 0xFFFF && rd32(c, S_EFFECT_VOL) != 0; }
+
+static int sound_hle(Cpu *c, uint32_t func) {
+    uint32_t a = c->r[EAX];
+    switch (func) {
+    case 0x26370:                                   /* start up: effect volume, music volume */
+        wr16(c, S_VOL_EFFECTS, a); wr16(c, S_VOL_MUSIC, c->r[EDX]);
+        snd_effect_volume(clamp127(a));
+        snd_music_volume(clamp127(c->r[EDX]));
+        hle_return(c, 0, 0);
+        return 1;
+    case 0x26498:                                   /* shut down */
+        snd_music_stop();
+        snd_effect_stop(0);
+        hle_return(c, 0, 0);
+        return 1;
+    case 0x264BC:                                   /* install music driver (one stack argument) */
+        wr8(c, S_MIDI_ON, 1); wr32(c, S_MUSIC_SEQ, 1);
+        hle_return(c, 0, 4);
+        return 1;
+    case 0x26898:                                   /* install digital driver (one stack argument) */
+        wr8(c, S_DIG_ON, 1); wr32(c, S_DIG_HANDLE, 1);
+        for (int i = 0; i < 4; i++) wr32(c, 0x59F30u + 8u * (uint32_t)i, 0);
+        hle_return(c, 0, 4);
+        return 1;
+    case 0x26590:                                   /* register XMIDI file image */
+        if (rd8(c, S_MIDI_ON)) { snd_music_stop(); wr16(c, 0x59F60u, 0xFFFF); wr32(c, S_MUSIC_FILE, a); }
+        hle_return(c, 0, 0);
+        return 1;
+    case 0x26648:                                   /* start music: sequence number */
+        if (rd8(c, S_MIDI_ON) && rd32(c, S_MUSIC_FILE)) music_start(c, (int16_t)a);
+        hle_return(c, 0, 0);
+        return 1;
+    case 0x266E0:                                   /* stop music */
+        snd_music_stop();
+        hle_return(c, 0, 0);
+        return 1;
+    case 0x267BC:                                   /* fade out over EAX ms, then stop everything */
+        snd_fade_out((int)(a & 0xFFFF));
+        hle_return(c, 0, 0);
+        return 1;
+    case 0x262E4: case 0x26310: case 0x2633C: {     /* play / loop / stop effect number EAX */
+        if (effect_allowed(c) && rd8(c, S_DIG_ON)) {
+            uint32_t file = rd32(c, S_EFFECTS + 4 * (a & 0xFFFF));
+            if (func == 0x2633C) snd_effect_stop(file);
+            else if (file && file < MEM_SIZE) snd_effect_play(G(c, file), MEM_SIZE - file, file, func == 0x26310);
+        }
+        hle_return(c, 0, 0);
+        return 1;
+    }
+    case 0x26B5C:                                   /* stop all effects */
+        snd_effect_stop(0);
+        hle_return(c, 0, 0);
+        return 1;
+    case 0x26C84:                                   /* effects still playing (AIL_active_sample_count) */
+        hle_return(c, rd8(c, S_DIG_ON) ? (uint32_t)snd_effects_playing() : 0, 0);
+        return 1;
+    case 0x26CE8:                                   /* effect volume */
+        if (rd8(c, S_DIG_ON)) { wr16(c, S_VOL_EFFECTS, (uint32_t)clamp127(a)); snd_effect_volume(clamp127(a)); }
+        hle_return(c, 0, 0);
+        return 1;
+    case 0x26DC0: {                                 /* music volume; 0 stops the music, back from 0 restarts it */
+        int old = (int16_t)rd16(c, S_VOL_MUSIC), v = clamp127(a);
+        if (rd8(c, S_MIDI_ON)) {
+            wr16(c, S_VOL_MUSIC, (uint32_t)v);
+            snd_music_volume(v);
+            if (rd32(c, S_MUSIC_FILE)) {
+                if (!old && v) music_start(c, 0);
+                else if (old && !v) snd_music_stop();
+            }
+        }
+        hle_return(c, 0, 0);
+        return 1;
+    }
+    }
+    return 0;
+}
+
 /* ---- functions replaced by the runtime (lift.py HLE) ------------------------- */
 static void on_hle(Cpu *c, uint32_t func) {
     switch (func) {
@@ -1119,7 +1309,8 @@ static void on_hle(Cpu *c, uint32_t func) {
         break;
     }
     default:
-        die(c, "no runtime implementation for %x", func);
+        if (!sound_hle(c, func)) die(c, "no runtime implementation for %x", func);
+        return;
     }
 }
 
@@ -1190,6 +1381,13 @@ int main(int argc, char *argv[]) {
     if (getenv("WAR_SNAPSHOT")) H.snapshot_ms = (uint64_t)(atof(getenv("WAR_SNAPSHOT")) * 1000);
     parse_script(getenv("WAR_INPUT"));
     H.start_ns = now_ns();
+    snd_init(AUDIO_RATE, H.game_dir);
+    audio_open();
+    if (getenv("WAR_WAV") && (wav_out = fopen(getenv("WAR_WAV"), "wb"))) {
+        static const uint32_t room[11];
+        fwrite(room, 4, 11, wav_out);                 /* header written by wav_close */
+        atexit(wav_close);
+    }
     H.mx_max = 639; H.my_max = 199;
     H.drive = 2;
 

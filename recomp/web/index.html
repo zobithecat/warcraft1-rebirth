@@ -44,6 +44,30 @@ function send(type, a, b, c) {
   Atomics.store(ring, 0, head + 1);
 }
 
+// Audio ring filled by the worker, played by audio.js: 0.25 s of float32 stereo.
+const AUDIO_RATE = 48000;
+const audioBuf = new SharedArrayBuffer(4 * 2 * (AUDIO_RATE / 4));
+const audioIdx = new SharedArrayBuffer(4 * 2);
+let audioStarted = false;
+// Browsers start sound only after a user gesture, so the first click or key does it.
+async function startAudio() {
+  if (audioStarted) return;
+  audioStarted = true;
+  try {
+    const ctx = new AudioContext({ sampleRate: AUDIO_RATE });
+    await ctx.audioWorklet.addModule("audio.js");
+    const node = new AudioWorkletNode(ctx, "war-audio", {
+      outputChannelCount: [2], processorOptions: { buf: audioBuf, idx: audioIdx },
+    });
+    node.connect(ctx.destination);
+    await ctx.resume();
+  } catch (err) {
+    log("audio: " + err);
+  }
+}
+window.addEventListener("pointerdown", startAudio);
+window.addEventListener("keydown", startAudio);
+
 // KeyboardEvent.code -> PC set-1 scancode (same keys as the native build).
 const SCAN = {
   Escape: 0x01, Digit1: 0x02, Digit2: 0x03, Digit3: 0x04, Digit4: 0x05, Digit5: 0x06, Digit6: 0x07,
@@ -92,7 +116,7 @@ worker.onmessage = (e) => {
   if (m.frame) {
     image.data.set(new Uint8ClampedArray(m.frame));
     ctx.putImageData(image, 0, 0);
-    if (frames++ === 0) { statusEl.textContent = "running — click the screen for keyboard focus"; canvas.focus(); }
+    if (frames++ === 0) { statusEl.textContent = "running — click the screen for keyboard focus and sound"; canvas.focus(); }
   } else if (m.log !== undefined) {
     log(m.log);
   } else if (m.status !== undefined) {
@@ -102,7 +126,7 @@ worker.onmessage = (e) => {
   }
 };
 worker.onerror = (e) => { statusEl.textContent = "worker error: " + e.message; };
-worker.postMessage({ ring: ring.buffer, env });
+worker.postMessage({ ring: ring.buffer, env, audioBuf, audioIdx });
 </script>
 </body>
 </html>
