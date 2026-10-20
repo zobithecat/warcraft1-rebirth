@@ -97,6 +97,11 @@ NO_OPS = {x86.X86_INS_NOP, x86.X86_INS_CLI, x86.X86_INS_STI, x86.X86_INS_WAIT}
 # address of an `int N; ret` stub (0x3CCF6 + 3*N) and "returns" into it, a
 # computed jump through the stack that the lifted code cannot follow.
 HLE = {0x3CC50: "int386 dispatch"}
+# Functions the runtime may take over call by call: f_<addr> asks the runtime
+# first (x86_wrap; nonzero means it handled the call, `ret` included) and
+# otherwise runs the original code, lifted as f_<addr>_orig.  Used for the
+# modern controls in runtime/game.c, which run where the game handles input.
+WRAP = {0x1B468: "right click on the map", 0x1A2B0: "left button released"}
 
 
 @dataclass
@@ -606,7 +611,12 @@ def emit_function(d: disasm.Disasm, f: int, whole: bool, lifted: set[int] | None
     fn = collect(d, f, whole)
     em = Emitter(fn, d, whole, lifted)
     em.emit()                       # first pass may add fall-through labels
-    return fn, Emitter(fn, d, whole, lifted).emit()
+    code = Emitter(fn, d, whole, lifted).emit()
+    if whole and f in WRAP:
+        code = code.replace(f"void f_{f:x}(Cpu *c) {{", f"static void f_{f:x}_orig(Cpu *c) {{", 1)
+        code += (f"void f_{f:x}(Cpu *c) {{  /* {WRAP[f]}: the runtime may take it over */\n"
+                 f"    if (!x86_wrap(c, 0x{f:X}u)) f_{f:x}_orig(c);\n}}\n")
+    return fn, code
 
 
 def lift_functions(d: disasm.Disasm, roots: list[int]) -> tuple[dict[int, str], dict[int, str]]:

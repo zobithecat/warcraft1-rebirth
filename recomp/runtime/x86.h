@@ -36,6 +36,7 @@ typedef struct Hooks {
     void (*trap)(Cpu *c, uint32_t at, const char *what);       /* untranslated instruction */
     uint32_t (*selector_base)(Cpu *c, uint16_t sel);            /* DPMI descriptor base */
     void (*hle)(Cpu *c, uint32_t func);                          /* function replaced by the runtime */
+    int (*wrap)(Cpu *c, uint32_t func);       /* lift.py WRAP: nonzero = handled, original skipped */
 } Hooks;
 
 struct Cpu {
@@ -134,6 +135,9 @@ static inline void x86_call(Cpu *c, uint32_t target, uint32_t at) {
 static inline void x86_hle(Cpu *c, uint32_t func) {
     if (!c->hooks || !c->hooks->hle) x86_stop(c, STOP_TRAP, func);
     c->hooks->hle(c, func);
+}
+static inline int x86_wrap(Cpu *c, uint32_t func) {
+    return c->hooks && c->hooks->wrap ? c->hooks->wrap(c, func) : 0;
 }
 static inline void x86_trap(Cpu *c, uint32_t at, const char *what) {
     if (c->hooks && c->hooks->trap) c->hooks->trap(c, at, what);

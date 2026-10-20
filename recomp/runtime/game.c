@@ -204,6 +204,19 @@ static void video_init(void) {
 }
 #endif
 
+/* Rubber-band selection in progress (see "modern controls" below): drawn over the frame. */
+static struct { int active, x0, y0, x1, y1; } drag;      /* 320x200 screen coordinates */
+#define DRAG_MIN 4                                         /* smaller boxes are clicks */
+
+static void draw_drag_box(uint32_t *px) {
+    int x0 = drag.x0 < drag.x1 ? drag.x0 : drag.x1, x1 = drag.x0 < drag.x1 ? drag.x1 : drag.x0;
+    int y0 = drag.y0 < drag.y1 ? drag.y0 : drag.y1, y1 = drag.y0 < drag.y1 ? drag.y1 : drag.y0;
+    if (!drag.active || (x1 - x0 < DRAG_MIN && y1 - y0 < DRAG_MIN)) return;
+    uint32_t green = PIXEL(0, 255, 0);
+    for (int x = x0; x <= x1; x++) px[y0 * 320 + x] = px[y1 * 320 + x] = green;
+    for (int y = y0; y <= y1; y++) px[y * 320 + x0] = px[y * 320 + x1] = green;
+}
+
 static void present(Cpu *c) {
     if (!H.video_on) return;
     static uint32_t px[320 * 200];
@@ -214,6 +227,7 @@ static void present(Cpu *c) {
     }
     const uint8_t *vram = G(c, VGA_BASE);
     for (int i = 0; i < 320 * 200; i++) px[i] = lut[vram[i]];
+    draw_drag_box(px);
 #ifdef __EMSCRIPTEN__
     web_present(px);
 #else
@@ -281,6 +295,189 @@ static void mouse_event(Cpu *c, uint32_t mask) {
     memcpy(c->r, save, sizeof save);
 }
 
+/* ---- modern controls -------------------------------------------------------------
+ * WarCraft (1994) has neither drag-box selection nor right-click orders: the
+ * right button recenters the map, and an order is a command button followed
+ * by a click on the target.  These add both through the game's own code:
+ *   right click with own units selected: attack an enemy, harvest a gold mine
+ *     or forest (peons), otherwise move.  Calls the game's order function
+ *     0x2E384 exactly as a target click after a command button does.
+ *   left drag over the map: select own units in the box (up to 4; shift adds
+ *     to the selection) with the game's set-selection function 0x25C50, which
+ *     a click and shift-clicks end in (0x2E2B0).
+ * Both run inside the game's input handlers (lift.py WRAP), not in the mouse
+ * interrupt, so they change game state where the game itself does.  The
+ * addresses come from memory dumps (WAR_INPUT "dump") and the code using them. */
+#define MAP_X0 72                 /* map viewport on screen: 15 x 11 tiles of 16 pixels */
+#define MAP_Y0 12
+#define MAP_X1 311
+#define MAP_Y1 187
+#define G_VIEW_X      0x500D0u    /* u16 top-left tile of the viewport */
+#define G_VIEW_Y      0x500D2u
+#define G_ALLIANCE    0x5008Cu    /* u8 per player: 1 = enemy of the human player */
+#define G_TILE_FLAGS  0x5828Cu    /* -> u16[64][64] */
+#define G_CURSOR_X    0x59138u    /* u16 screen position the game acts on */
+#define G_CURSOR_Y    0x5913Au
+#define G_FRAME_HOOK  0x59134u    /* per-frame input handler; 0x1A0F0 while playing a map */
+#define G_SELECTION   0x59E00u    /* unit *[4] */
+#define G_GROUPABLE   0x51C04u    /* u16 per unit type: may be selected together with others */
+#define G_UNITS       0x5A1A0u    /* unit *[], 0-terminated: units in play */
+#define G_HOVER       0x5A4CCu    /* unit under the cursor */
+#define G_COMMAND     0x5A4D4u    /* u16 order for the next target: 3 move, 4 attack, 10 harvest */
+#define G_LSHIFT      0x61848u    /* u16 key down; key table at 0x617F4 by scancode */
+#define G_RSHIFT      0x61860u
+#define U_X           0x00        /* unit: u16 pixel position of the 16x16 sprite */
+#define U_Y           0x02
+#define U_TYPE        0x1B        /* u8: 2/3 peasant/peon, 0x20.. buildings, 0x32 gold mine */
+#define U_OWNER       0x1E        /* u8: 0 = the human player */
+#define TILE_FOREST   0x80
+#define CMD_MOVE      3
+#define CMD_ATTACK    4
+#define CMD_HARVEST   10
+
+static struct { int pending, mx0, my0, sx1, sy1; } box;   /* a finished drag, for the next left-up */
+/* A selection sent by box_select that the game has not applied yet (it goes
+ * through the game's command queue, ahead of any order given right after). */
+static struct { uint32_t unit[4]; int n; uint64_t ms; } sent;
+
+static int in_map(int x, int y) { return x >= MAP_X0 && x <= MAP_X1 && y >= MAP_Y0 && y <= MAP_Y1; }
+static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static int is_worker(uint32_t type) { return type == 2 || type == 3; }
+
+/* Call a lifted function from a hook: Watcom register arguments, our registers kept. */
+static void call_near(Cpu *c, uint32_t func, uint32_t eax, uint32_t edx, uint32_t ebx) {
+    uint32_t save[8];
+    memcpy(save, c->r, sizeof save);
+    Flags save_f = c->f;
+    c->r[ESP] -= 4;
+    wr32(c, c->r[ESP], CALLBACK_RET);
+    c->r[EAX] = eax;
+    c->r[EDX] = edx;
+    c->r[EBX] = ebx;
+    dispatch(c, func, 0);
+    memcpy(c->r, save, sizeof save);
+    c->f = save_f;
+}
+
+/* The selection an order given now applies to. */
+static int current_selection(Cpu *c, uint32_t out[4]) {
+    int n = 0, same = 1;
+    for (int i = 0; i < 4; i++) {
+        uint32_t u = rd32(c, G_SELECTION + 4 * i);
+        if (u) out[n++] = u;
+    }
+    for (int i = 0; i < sent.n; i++) same &= i < n && out[i] == sent.unit[i];
+    if (sent.n && (same || now_ms() > sent.ms + 1000)) sent.n = 0;     /* applied (or lost) */
+    if (!sent.n) return n;
+    memcpy(out, sent.unit, sizeof sent.unit);
+    return sent.n;
+}
+
+/* Right click on the map (0x1B468).  Returns 0 to keep the original recentering. */
+static int right_click_order(Cpu *c) {
+    int workers = 0, others = 0;
+    uint32_t sel[4];
+    int n = current_selection(c, sel);
+    for (int i = 0; i < n; i++) {
+        uint32_t u = sel[i];
+        uint32_t type = rd8(c, u + U_TYPE);
+        if (rd8(c, u + U_OWNER) != 0 || type >= 0x20) return 0;    /* enemy or building selected */
+        if (is_worker(type)) workers++; else others++;
+    }
+    if (!workers && !others) return 0;
+    int tx = ((int)rd16(c, G_CURSOR_X) - MAP_X0) / 16 + (int)rd16(c, G_VIEW_X);
+    int ty = ((int)rd16(c, G_CURSOR_Y) - MAP_Y0) / 16 + (int)rd16(c, G_VIEW_Y);
+    if (tx < 0 || tx > 63 || ty < 0 || ty > 63) return 0;
+    uint32_t target = rd32(c, G_HOVER), cmd = CMD_MOVE;
+    if (target) {
+        if (others && rd8(c, G_ALLIANCE + rd8(c, target + U_OWNER)) == 1) cmd = CMD_ATTACK;
+        else if (workers && rd8(c, target + U_TYPE) == 0x32) cmd = CMD_HARVEST;
+    } else if (workers && rd16(c, rd32(c, G_TILE_FLAGS) + 2u * (uint32_t)(ty * 64 + tx)) & TILE_FOREST) {
+        cmd = CMD_HARVEST;
+    }
+    wr16(c, G_COMMAND, cmd);
+    call_near(c, 0x2E384, (uint32_t)tx, (uint32_t)ty, target);
+    return 1;
+}
+
+/* Left button released (0x1A2B0) after a drag: select own units in the box. */
+static int selectable(Cpu *c, uint32_t u) {
+    uint32_t type = rd8(c, u + U_TYPE);
+    return rd8(c, u + U_OWNER) == 0 && type < 0x20 && rd16(c, G_GROUPABLE + 2 * type) != 0;
+}
+
+static void box_select(Cpu *c) {
+    int mx1 = box.sx1 - MAP_X0 + 16 * (int)rd16(c, G_VIEW_X), my1 = box.sy1 - MAP_Y0 + 16 * (int)rd16(c, G_VIEW_Y);
+    int x0 = box.mx0 < mx1 ? box.mx0 : mx1, x1 = box.mx0 < mx1 ? mx1 : box.mx0;
+    int y0 = box.my0 < my1 ? box.my0 : my1, y1 = box.my0 < my1 ? my1 : box.my0;
+    uint32_t pick[4];
+    int n = 0, found = 0;
+    if (rd16(c, G_LSHIFT) || rd16(c, G_RSHIFT)) {           /* shift-drag adds to the selection */
+        uint32_t cur[4];
+        int k = current_selection(c, cur);
+        for (int i = 0; i < k; i++)
+            if (selectable(c, cur[i])) pick[n++] = cur[i];
+    }
+    for (uint32_t p = G_UNITS; n < 4 && p < G_UNITS + 4 * 1024; p += 4) {
+        uint32_t u = rd32(c, p);
+        if (!u) break;
+        if (!selectable(c, u)) continue;
+        int cx = (int)rd16(c, u + U_X) + 8, cy = (int)rd16(c, u + U_Y) + 8;
+        if (cx < x0 || cx > x1 || cy < y0 || cy > y1) continue;
+        int dup = 0;
+        for (int i = 0; i < n; i++) dup |= pick[i] == u;
+        if (!dup) pick[n++] = u;
+        found = 1;
+    }
+    if (!found) return;
+    c->r[ESP] -= 16;                                          /* the array lives on the guest stack */
+    uint32_t arr = c->r[ESP];
+    for (int i = 0; i < n; i++) wr32(c, arr + 4u * (uint32_t)i, pick[i]);
+    call_near(c, 0x25C50, (uint32_t)n, arr, 0);
+    c->r[ESP] += 16;
+    memcpy(sent.unit, pick, sizeof pick);
+    sent.n = n;
+    sent.ms = now_ms();
+}
+
+/* Runs in the mouse "interrupt": only tracks the drag; the game state is changed in box_select. */
+static void track_drag(Cpu *c, int button, int down) {
+    int sx = H.mouse_x >> 1, sy = H.mouse_y;                  /* the game halves the driver's x */
+    if (button == 1 && down) {
+        drag.active = in_map(sx, sy) && rd32(c, G_FRAME_HOOK) == 0x1A0F0 && rd16(c, G_COMMAND) == 0;
+        drag.x0 = drag.x1 = sx;
+        drag.y0 = drag.y1 = sy;
+        box.mx0 = sx - MAP_X0 + 16 * (int)rd16(c, G_VIEW_X);
+        box.my0 = sy - MAP_Y0 + 16 * (int)rd16(c, G_VIEW_Y);
+        return;
+    }
+    if (!drag.active) return;
+    drag.x1 = clampi(sx, MAP_X0, MAP_X1);
+    drag.y1 = clampi(sy, MAP_Y0, MAP_Y1);
+    if (button == 1 && !down) {
+        drag.active = 0;
+        if (abs(drag.x1 - drag.x0) >= DRAG_MIN || abs(drag.y1 - drag.y0) >= DRAG_MIN) {
+            box.pending = 1;
+            box.sx1 = drag.x1;
+            box.sy1 = drag.y1;
+        }
+    }
+}
+
+static int on_wrap(Cpu *c, uint32_t func) {
+    switch (func) {
+    case 0x1B468:                                   /* right click on the map */
+        if (!right_click_order(c)) return 0;
+        c->ret_to = rd32(c, c->r[ESP]);             /* the original's `ret` */
+        c->r[ESP] += 4;
+        return 1;
+    case 0x1A2B0:                                   /* left button released */
+        if (box.pending) { box.pending = 0; box_select(c); }
+        return 0;
+    }
+    return 0;
+}
+
 /* Pointer at (fx, fy) in 1/65536ths of the window; button: 0 = move, 1/2/4 = left/right/middle. */
 static void mouse_input(Cpu *c, uint32_t fx, uint32_t fy, int button, int down) {
     int span_x = H.mx_max - H.mx_min, span_y = H.my_max - H.my_min;
@@ -293,6 +490,7 @@ static void mouse_input(Cpu *c, uint32_t fx, uint32_t fy, int button, int down) 
         if (down) { H.mouse_buttons |= button; mask = button == 1 ? 2 : button == 2 ? 8 : 32; }
         else { H.mouse_buttons &= ~button; mask = button == 1 ? 4 : button == 2 ? 16 : 64; }
     }
+    track_drag(c, button, down);
     mouse_event(c, mask);
 }
 
@@ -309,13 +507,17 @@ typedef struct {
  * back until the button has been down MIN_CLICK_MS.  Scripted clicks move
  * first and press MIN_CLICK_MS later, like a hand on a real mouse. */
 #define MIN_CLICK_MS 100
-#define MAX_TIMED 8
+#define MAX_TIMED 32
 static struct { InputEvent ev; uint64_t due; } timed[MAX_TIMED];   /* in due order */
 static int timed_len;
 static uint64_t pressed_at[8];
 
 static void defer_input(InputEvent ev, uint64_t due) {
-    if (timed_len < MAX_TIMED) { timed[timed_len].ev = ev; timed[timed_len].due = due; timed_len++; }
+    if (timed_len == MAX_TIMED) return;
+    int i = timed_len++;
+    for (; i > 0 && timed[i - 1].due > due; i--) timed[i] = timed[i - 1];   /* stable: equal times keep order */
+    timed[i].ev = ev;
+    timed[i].due = due;
 }
 
 static void handle_input(Cpu *c, const InputEvent *ev, uint64_t now) {
@@ -329,10 +531,27 @@ static void handle_input(Cpu *c, const InputEvent *ev, uint64_t now) {
 }
 
 /* Feed input to the game in order; anything behind an event that is not due yet stays queued. */
+/* A press waits (up to MIN_CLICK_MS) for the game to draw its cursor where the
+ * pointer is: a quick flick-and-click would otherwise act on the old spot. */
+#define G_DRAWN_CURSOR 0x617EAu   /* u16 x (halved), y */
+static InputEvent press_wait;
+static uint64_t press_since;
+static int press_waiting;
+
+static int cursor_caught_up(Cpu *c) {
+    return rd16(c, G_DRAWN_CURSOR) == (uint32_t)(H.mouse_x >> 1) && rd16(c, G_DRAWN_CURSOR + 2) == (uint32_t)H.mouse_y;
+}
+
 static void feed_input(Cpu *c, uint64_t now, int (*next)(InputEvent *)) {
     InputEvent ev;
     for (;;) {
-        if (timed_len) {
+        int waited = 0;
+        if (press_waiting) {
+            if (!cursor_caught_up(c) && now < press_since + MIN_CLICK_MS) return;
+            ev = press_wait;
+            press_waiting = 0;
+            waited = 1;
+        } else if (timed_len) {
             if (now < timed[0].due) return;
             ev = timed[0].ev;
             memmove(timed, timed + 1, (size_t)--timed_len * sizeof timed[0]);
@@ -341,6 +560,15 @@ static void feed_input(Cpu *c, uint64_t now, int (*next)(InputEvent *)) {
         } else if (ev.type == 2 && (ev.c & 7) && !(ev.c & 8) && now < pressed_at[ev.c & 7] + MIN_CLICK_MS) {
             defer_input(ev, pressed_at[ev.c & 7] + MIN_CLICK_MS);
             return;
+        }
+        if (!waited && ev.type == 2 && (ev.c & 8)) {
+            mouse_input(c, (uint32_t)ev.a, (uint32_t)ev.b, 0, 0);      /* the pointer gets there first */
+            if (!cursor_caught_up(c)) {
+                press_wait = ev;
+                press_since = now;
+                press_waiting = 1;
+                return;
+            }
         }
         handle_input(c, &ev, now);
     }
@@ -352,21 +580,25 @@ typedef struct { uint64_t ms; char what[32]; } ScriptStep;
 static ScriptStep script[64];
 static int script_len, script_pos;
 
+/* A step ends at the comma that starts the next "time:" step, so click@x,y and
+ * drag@x1,y1,x2,y2 keep their own commas. */
+static const char *next_step(const char *s) {
+    for (const char *p = strchr(s, ','); p; p = strchr(p + 1, ',')) {
+        const char *q = p + 1;
+        while ((*q >= '0' && *q <= '9') || *q == '.') q++;
+        if (q > p + 1 && *q == ':') return p;
+    }
+    return NULL;
+}
+
 static void parse_script(const char *s) {
     while (s && *s && script_len < 64) {
         ScriptStep *st = &script[script_len++];
         st->ms = (uint64_t)(atof(s) * 1000);
         const char *colon = strchr(s, ':');
         if (!colon) break;
-        const char *end = strchr(colon + 1, ',');
-        while (end && end[1] >= '0' && end[1] <= '9' && strchr(end + 1, ':') == NULL) end = strchr(end + 1, ',');
+        const char *end = next_step(colon + 1);
         size_t n = end ? (size_t)(end - colon - 1) : strlen(colon + 1);
-        /* click@x,y contains a comma: take it whole */
-        if (strncmp(colon + 1, "click@", 6) == 0 || strncmp(colon + 1, "rclick@", 7) == 0) {
-            const char *c2 = strchr(colon + 1, ',');
-            end = c2 ? strchr(c2 + 1, ',') : NULL;
-            n = end ? (size_t)(end - colon - 1) : strlen(colon + 1);
-        }
         snprintf(st->what, sizeof st->what, "%.*s", (int)n, colon + 1);
         s = end ? end + 1 : NULL;
     }
@@ -378,10 +610,17 @@ static void run_script(Cpu *c, uint64_t now) {
     static const struct { const char *name; uint8_t scan; } keys[] = {
         {"esc", 0x01}, {"return", 0x1C}, {"space", 0x39}, {"up", 0x48}, {"down", 0x50},
         {"left", 0x4B}, {"right", 0x4D}, {"n", 0x31}, {"y", 0x15}, {"s", 0x1F}, {"h", 0x23}, {"o", 0x18},
-        {"c", 0x2E}, {"l", 0x26}, {"q", 0x10}, {"x", 0x2D}, {"e", 0x12}, {"t", 0x14},
+        {"c", 0x2E}, {"l", 0x26}, {"q", 0x10}, {"x", 0x2D}, {"e", 0x12}, {"t", 0x14}, {"m", 0x32},
+        {"a", 0x1E}, {"g", 0x22}, {"b", 0x30}, {"r", 0x13},
     };
     while (script_pos < script_len && now >= script[script_pos].ms) {
         const char *w = script[script_pos++].what;
+        int shift = strncmp(w, "shift+", 6) == 0;     /* shift+click@x,y: left shift held over the click */
+        if (shift) {
+            w += 6;
+            defer_input((InputEvent){ 1, 0x2A, 0, 0 }, now);
+            defer_input((InputEvent){ 1, 0xAA, 0, 0 }, now + 3 * MIN_CLICK_MS);
+        }
         if (strcmp(w, "snap") == 0) {
             char path[64];
             snprintf(path, sizeof path, "build/screen_%llu.ppm", (unsigned long long)(now / 1000));
@@ -396,6 +635,42 @@ static void run_script(Cpu *c, uint64_t now) {
             defer_input(ev, now + MIN_CLICK_MS);
             ev.c = button;
             defer_input(ev, now + 2 * MIN_CLICK_MS);
+        } else if (strncmp(w, "move@", 5) == 0) {         /* move@x,y: pointer only */
+            int x = 0, y = 0;
+            sscanf(w + 5, "%d,%d", &x, &y);
+            defer_input((InputEvent){ 2, x * 65536 / 320, y * 65536 / 200, 0 }, now);
+        } else if (strncmp(w, "fastdrag@", 9) == 0) {     /* all at once, like a synthetic drag */
+            int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            sscanf(w + 9, "%d,%d,%d,%d", &x1, &y1, &x2, &y2);
+            InputEvent ev = { 2, x1 * 65536 / 320, y1 * 65536 / 200, 1 | 8 };
+            defer_input(ev, now);
+            ev.c = 0;
+            for (int k = 1; k <= 4; k++) {
+                ev.a = (x1 + (x2 - x1) * k / 4) * 65536 / 320;
+                ev.b = (y1 + (y2 - y1) * k / 4) * 65536 / 200;
+                defer_input(ev, now);
+            }
+            ev.c = 1;
+            defer_input(ev, now);
+        } else if (strncmp(w, "drag@", 5) == 0) {         /* drag@x1,y1,x2,y2: left button down from 1 to 2 */
+            int x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+            sscanf(w + 5, "%d,%d,%d,%d", &x1, &y1, &x2, &y2);
+            InputEvent ev = { 2, x1 * 65536 / 320, y1 * 65536 / 200, 0 };
+            defer_input(ev, now);
+            ev.c = 1 | 8;
+            defer_input(ev, now + MIN_CLICK_MS);
+            ev.c = 0;
+            ev.a = (x1 + x2) / 2 * 65536 / 320; ev.b = (y1 + y2) / 2 * 65536 / 200;
+            defer_input(ev, now + 2 * MIN_CLICK_MS);
+            ev.a = x2 * 65536 / 320; ev.b = y2 * 65536 / 200;
+            defer_input(ev, now + 3 * MIN_CLICK_MS);
+            ev.c = 1;
+            defer_input(ev, now + 4 * MIN_CLICK_MS);
+        } else if (strcmp(w, "dump") == 0) {            /* all guest memory, for finding game state */
+            char path[64];
+            snprintf(path, sizeof path, "build/mem_%llu.bin", (unsigned long long)(now / 100));
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(c->mem, 1, MEM_SIZE, f); fclose(f); fprintf(stderr, "war: saved %s\n", path); }
         } else if (strcmp(w, "quit") == 0) {
             x86_stop(c, STOP_EXIT, 0);
         } else {
@@ -848,7 +1123,7 @@ static void on_hle(Cpu *c, uint32_t func) {
     }
 }
 
-static const Hooks HOOKS = { on_int, on_in, on_out, dispatch, on_trap, sel_base, on_hle };
+static const Hooks HOOKS = { on_int, on_in, on_out, dispatch, on_trap, sel_base, on_hle, on_wrap };
 
 /* ---- checkpoint dumps (debugging; RECOMP_TRACE builds) ------------------------------ */
 #ifdef RECOMP_TRACE
