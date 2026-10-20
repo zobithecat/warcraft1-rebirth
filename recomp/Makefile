@@ -3,6 +3,7 @@
 #   make play       build and run the game (build/war)
 #   make wasm       browser build in build/web (Emscripten); make serve to play it
 #   make deploy     upload build/web to S3 + CloudFront behind a password (AWS CLI)
+#   make hooks      deploy automatically on every push of master (git pre-push hook)
 #   make            build/war and build/blitview
 #   make frames     work/demo/intro.wcf from captures in work/frames
 #   make check      decode every frame natively and verify against DOSBox-X
@@ -23,7 +24,7 @@ WAREXE  := work/exe/war.exe
 LIFTED  := build/lifted_rt.c
 FRAMES  := work/demo/intro.wcf
 
-.PHONY: all frames check run clean war play wasm serve wasm-test deploy
+.PHONY: all frames check run clean war play wasm serve wasm-test deploy hooks
 
 all: build/blitview build/war
 
@@ -80,6 +81,9 @@ serve: wasm
 
 deploy: wasm
 	$(PYTHON) tools/deploy_aws.py
+
+hooks:
+	git config core.hooksPath recomp/tools/git-hooks
 
 # The same wasm under Node with the real file system: headless runs with
 # WAR_INPUT/WAR_SNAPSHOT, like build/war.  make wasm-test boots into the first

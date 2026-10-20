@@ -7,8 +7,8 @@
 
 war.data is the original, copyrighted game data, hence the password.  The
 password and the resource ids live in work/deploy.json (not in git); rerunning
-reuses them and only uploads the files again.  Uses the AWS CLI's current
-credentials and region.
+reuses them and uploads only the files that changed (by a sha256 kept in each
+object's metadata).  Uses the AWS CLI's current credentials and region.
 
 Usage: deploy_aws.py [--new-password] [--no-wait]
 """
@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import gzip
+import hashlib
 import json
 import pathlib
 import secrets
@@ -171,13 +172,19 @@ def ensure_bucket_policy(st: dict, account: str) -> None:
     aws("s3api", "put-bucket-policy", "--bucket", st["bucket"], "--policy", json.dumps(policy))
 
 
-def upload(st: dict) -> None:
+def upload(st: dict) -> list[str]:
+    """Upload what changed since the last deploy; returns the published paths."""
+    changed = []
     for name, (ctype, gz) in FILES.items():
         src = WEB / name
         if not src.exists():
             sys.exit(f"{src} missing: run make wasm first")
+        digest = hashlib.sha256(src.read_bytes()).hexdigest()
+        head = aws("s3api", "head-object", "--bucket", st["bucket"], "--key", name, check=False)
+        if head.get("Metadata", {}).get("source-sha256") == digest:
+            continue
         args = ["s3", "cp", str(src), f"s3://{st['bucket']}/{name}", "--content-type", ctype,
-                "--cache-control", "no-cache", "--only-show-errors"]
+                "--cache-control", "no-cache", "--metadata", f"source-sha256={digest}", "--only-show-errors"]
         if gz:
             packed = STAGE / name
             with open(src, "rb") as fi, gzip.open(packed, "wb", compresslevel=6) as fo:
@@ -186,7 +193,14 @@ def upload(st: dict) -> None:
             args += ["--content-encoding", "gzip"]
         aws(*args)
         print(f"uploaded {name}")
-    aws("cloudfront", "create-invalidation", "--distribution-id", st["distribution"], "--paths", "/*")
+        changed.append("/" + name)
+        if name == "index.html":
+            changed.append("/")
+    if changed:
+        aws("cloudfront", "create-invalidation", "--distribution-id", st["distribution"], "--paths", *changed)
+    else:
+        print("nothing changed since the last deploy")
+    return changed
 
 
 def main() -> None:
@@ -212,8 +226,7 @@ def main() -> None:
     ensure_function(st); save()
     ensure_distribution(st, region); save()
     ensure_bucket_policy(st, account)
-    upload(st)
-    if not args.no_wait:
+    if upload(st) and not args.no_wait:
         print("waiting for CloudFront to deploy (several minutes)...")
         subprocess.run(["aws", "cloudfront", "wait", "distribution-deployed", "--id", st["distribution"]], check=True)
     print(f"https://{st['domain']}/  user: {USER}  password: see {STATE.relative_to(ROOT)}")

@@ -1,0 +1,36 @@
+#!/bin/sh
+# Deploy the browser build (make deploy) whenever master is pushed.
+# Installed by `make hooks` (git config core.hooksPath recomp/tools/git-hooks).
+# Push without deploying: SKIP_DEPLOY=1 git push   (or git push --no-verify)
+#
+# git has no post-push hook, so this runs before the push; a failed deploy
+# stops the push.  The deploy is built from the working tree, so it refuses
+# to run unless that tree is exactly the commit being pushed.
+[ -n "$SKIP_DEPLOY" ] && exit 0
+PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"    # emcc, aws: also when pushing from a GUI
+
+pushed=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ "$remote_ref" = refs/heads/master ] && [ "$local_sha" != 0000000000000000000000000000000000000000 ]; then
+        pushed=$local_sha
+    fi
+done
+[ -n "$pushed" ] || exit 0
+
+root=$(git rev-parse --show-toplevel)
+if [ "$pushed" != "$(git rev-parse HEAD)" ]; then
+    echo "pre-push: master is not the checked-out commit, so the deploy would not match it." >&2
+    echo "          Check it out first, or push with SKIP_DEPLOY=1." >&2
+    exit 1
+fi
+if [ -n "$(git -C "$root" status --porcelain --untracked-files=no -- recomp)" ]; then
+    echo "pre-push: recomp/ has uncommitted changes that the deploy would include." >&2
+    echo "          Commit or stash them, or push with SKIP_DEPLOY=1." >&2
+    exit 1
+fi
+
+echo "pre-push: deploying the browser build (make deploy)..."
+if ! make -C "$root/recomp" deploy; then
+    echo "pre-push: deploy failed; push stopped (SKIP_DEPLOY=1 git push to push anyway)." >&2
+    exit 1
+fi

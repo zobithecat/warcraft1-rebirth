@@ -41,8 +41,12 @@ make serve        # build/web을 만들고 http://localhost:8000/ 에서 서비�
 - `make deploy`: `build/web`을 AWS에 올립니다(AWS CLI의 현재 자격 증명·리전 사용, `tools/deploy_aws.py`).
   모든 공개 접근을 막은 S3 버킷 ← CloudFront(Origin Access Control). CloudFront Function이 HTTP 기본 인증을 검사하고,
   응답 헤더 정책이 COOP/COEP를 붙입니다(S3 정적 웹사이트 호스팅만으로는 이 헤더를 붙일 수 없음). `war.data`는 gzip으로 올려 74MB → 49MB.
-  주소·사용자·비밀번호와 리소스 ID는 `work/deploy.json`(git 제외)에 저장되고, 다시 실행하면 파일만 올리고 캐시를 무효화합니다.
-  비밀번호 교체는 `python3 tools/deploy_aws.py --new-password`.
+  주소·사용자·비밀번호와 리소스 ID는 `work/deploy.json`(git 제외)에 저장됩니다. 다시 실행하면 바뀐 파일만 올리고(객체 메타데이터의
+  sha256과 비교) 그 경로만 캐시 무효화합니다. 비밀번호 교체는 `python3 tools/deploy_aws.py --new-password`.
+- `make hooks`: master를 푸시할 때마다 `make deploy`가 자동으로 돕니다(`tools/git-hooks/pre-push`, `git config core.hooksPath`).
+  git에는 푸시 뒤 훅이 없어 푸시 직전에 배포하고, 배포가 실패하면 푸시를 멈춥니다. 배포는 작업 트리로 빌드하므로
+  `recomp/`에 커밋 안 된 변경이 있거나 푸시하는 커밋이 체크아웃된 커밋이 아니면 거부합니다.
+  배포 없이 푸시: `SKIP_DEPLOY=1 git push`(또는 `git push --no-verify`). 훅 설정은 clone마다 `make hooks`로 한 번 해야 합니다.
 - `make wasm-test`: 같은 wasm을 Node.js에서 창 없이 실행(`build/web/war-node.js`, 실제 파일 시스템 사용).
   네이티브와 같은 입력 스크립트를 주면 화면이 픽셀 단위로 같은지 비교할 수 있습니다.
 
