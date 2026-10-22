@@ -83,11 +83,16 @@ make serve        # build/web을 만들고 http://localhost:8000/ 에서 서비�
 | `tools/le.py`, `tools/disasm.py` | LE 로더, 재귀 하강 디스어셈블러 |
 | `tools/lift.py --all` | 전체 프로그램 x86 → C 변환 (`build/game.c`, 약 28만 줄) |
 | `tools/mkimage.py` | 재배치된 메모리 이미지 (`build/image.bin`) |
-| `runtime/x86.h` | 게스트 메모리, 플래그, ALU, 런타임 훅 |
+| `runtime/x86.h` | 게스트 메모리, 플래그, ALU, x87, 런타임 훅 |
 | `runtime/game.c` | DOS/DOS4GW/DPMI/VGA/키보드/마우스 대체 구현, SDL2 창·오디오, 사운드 래퍼 대체 |
 | `runtime/sound.c` | 효과음 믹서, XMIDI 재생, AIL AdLib 드라이버 동작, OPL2 모델 |
 | `tools/soundtest.c`, `tools/soundcmp.py` | 소리 검증: 곡·레지스터 기록을 WAV로 렌더, DOSBox-X 녹음과 비교 |
 | `tools/ckdiff.py`, `tools/bisect_call.sh` | 디버깅: 함수 진입 상태를 덤프해 Unicorn(원본 x86)과 비교 |
+| `tools/alutest.py`, `tools/x87test.py` | 명령 단위 검증: ALU 헬퍼, lift.py의 x87 변환을 Unicorn과 비교 |
+
+다른 게임에도 같은 도구를 씁니다: `lift.py OUT.c --exe EXE --profile PROFILE.py [--bases ...] --all`,
+`mkimage.py OUT.bin EXE [--bases ...]`. 프로필은 게임별 `HLE`/`WRAP`, 자기 수정 피연산자(`PATCH_OPERANDS`),
+x87 사용 여부(`FPU`)를 정합니다. 예: [../worms](../worms).
 
 변환 방식과 검증은 [LIFTER.md](LIFTER.md), 바이너리 분석은 [SCOPING.md](SCOPING.md)에 있습니다.
 

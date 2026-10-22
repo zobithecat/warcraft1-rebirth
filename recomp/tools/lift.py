@@ -59,6 +59,7 @@ SEGS = {x86.X86_REG_ES: "SEG_ES", x86.X86_REG_CS: "SEG_CS", x86.X86_REG_SS: "SEG
 GPRS = ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi"]
 MASK = {8: "0xFFu", 16: "0xFFFFu", 32: "0xFFFFFFFFu"}
 ACC = {1: x86.X86_REG_AL, 2: x86.X86_REG_AX, 4: x86.X86_REG_EAX}
+CONTROL = {x86.X86_REG_CR0, x86.X86_REG_CR2, x86.X86_REG_CR3, x86.X86_REG_CR4}
 
 COND = {
     x86.X86_INS_JO: "f.of", x86.X86_INS_JNO: "!f.of", x86.X86_INS_JB: "f.cf", x86.X86_INS_JAE: "!f.cf",
@@ -122,6 +123,18 @@ HLE.update({
 # modern controls in runtime/game.c, which run where the game handles input.
 WRAP = {0x1B468: "right click on the map", 0x1A2B0: "left button released",
         0x1A0F0: "per-frame input on the map"}
+# Other games pass --profile FILE.py defining their own HLE and WRAP (and
+# PATCH_OPERANDS = True when the program rewrites operands of its own code,
+# FPU = True when it uses the x87; WarCraft does not, and its C runtime is
+# meant to find no coprocessor).
+PATCH_OPERANDS = False
+FPU = False
+# Instructions whose immediate or displacement the program rewrites at run
+# time (self-modifying inner loops): addr -> {"imm": (offset, size), "disp": ...}.
+# Their lifted form reads those bytes from guest memory instead of baking in
+# the value seen on disk.
+PATCHED: dict[int, dict] = {}
+UNROLL_SPAN = 0x4000     # how far from a patched instruction to look for unrolled copies
 
 
 @dataclass
@@ -195,6 +208,68 @@ def rep_prefix(i: disasm.Insn) -> int | None:
     return rep
 
 
+def x87_opcode(i: disasm.Insn) -> int | None:
+    """Index of the D8-DF escape byte of an x87 instruction (after prefixes and fwait), else None."""
+    k = 0
+    while k < len(i.bytes) and (i.bytes[k] in PREFIX_BYTES or i.bytes[k] == 0x9B):
+        k += 1
+    return k if k + 1 < len(i.bytes) and 0xD8 <= i.bytes[k] <= 0xDF else None
+
+
+def _x87_arith(reg: int):
+    """ST(0)-form arithmetic by ModRM reg field: dst = a op b (fcom/fcomp compare a with b)."""
+    def gen(a: str, b: str, dst: str) -> list[str]:
+        if reg == 2:
+            return [f"fcom(c, {a}, {b});"]
+        if reg == 3:
+            return [f"fcom(c, {a}, {b});", "fpop(c);"]
+        expr = {0: f"{a} + {b}", 1: f"{a} * {b}", 4: f"{a} - {b}", 5: f"{b} - {a}",
+                6: f"{a} / {b}", 7: f"{b} / {a}"}[reg]
+        return [f"{dst} = {expr};"]
+    return gen
+
+
+X87_ARITH = [_x87_arith(r) for r in range(8)]
+# D9 register forms without an operand
+_S0 = "FST(c, 0)"
+_S1 = "FST(c, 1)"
+X87_D9 = {
+    0xD0: [],                                                        # fnop
+    0xE0: [f"{_S0} = -{_S0};"],                                      # fchs
+    0xE1: [f"{_S0} = fabs({_S0});"],
+    0xE4: [f"fcom(c, {_S0}, 0.0);"],                                 # ftst
+    0xE5: [f"fxam(c, {_S0});"],
+    0xE8: ["fpush(c, 1.0);"],
+    0xE9: ["fpush(c, 3.3219280948873623);"],                         # log2(10)
+    0xEA: ["fpush(c, 1.4426950408889634);"],                         # log2(e)
+    0xEB: ["fpush(c, 3.141592653589793);"],
+    0xEC: ["fpush(c, 0.30102999566398120);"],                        # log10(2)
+    0xED: ["fpush(c, 0.69314718055994531);"],                        # ln(2)
+    0xEE: ["fpush(c, 0.0);"],
+    0xF0: [f"{_S0} = exp2({_S0}) - 1.0;"],                           # f2xm1
+    0xF1: [f"{_S1} = {_S1} * log2({_S0});", "fpop(c);"],             # fyl2x
+    0xF2: [f"{_S0} = tan({_S0});", "c->fsw &= (uint16_t)~0x0400u;", "fpush(c, 1.0);"],   # fptan
+    0xF3: [f"{_S1} = atan2({_S1}, {_S0});", "fpop(c);"],             # fpatan
+    0xF4: ["{", f"double x = {_S0}, e = x != 0 ? logb(x) : -INFINITY;",
+           f"{_S0} = e;", "fpush(c, x != 0 ? ldexp(x, -(int)e) : x);", "}"],          # fxtract
+    0xF5: ["{", f"double q = nearbyint({_S0} / {_S1});", "uint64_t n = (uint64_t)fabs(q);",
+           f"{_S0} = remainder({_S0}, {_S1});",
+           "c->fsw = (uint16_t)((c->fsw & ~0x4700u) | (n & 4) << 6 | (n & 2) << 13 | (n & 1) << 9);", "}"],   # fprem1
+    0xF6: ["c->ftop = (c->ftop - 1) & 7;"],                          # fdecstp
+    0xF7: ["c->ftop = (c->ftop + 1) & 7;"],                          # fincstp
+    0xF8: ["{", f"double q = trunc({_S0} / {_S1});", "uint64_t n = (uint64_t)fabs(q);",
+           f"{_S0} = fmod({_S0}, {_S1});",
+           "c->fsw = (uint16_t)((c->fsw & ~0x4700u) | (n & 4) << 6 | (n & 2) << 13 | (n & 1) << 9);", "}"],   # fprem
+    0xF9: [f"{_S1} = {_S1} * log2({_S0} + 1.0);", "fpop(c);"],       # fyl2xp1
+    0xFA: [f"{_S0} = sqrt({_S0});"],
+    0xFB: ["{", f"double x = {_S0};", f"{_S0} = sin(x);", "fpush(c, cos(x));", "c->fsw &= (uint16_t)~0x0400u;", "}"],
+    0xFC: [f"{_S0} = fround(c, {_S0});"],                            # frndint
+    0xFD: [f"{_S0} = ldexp({_S0}, (int)trunc({_S1}));"],             # fscale
+    0xFE: [f"{_S0} = sin({_S0});", "c->fsw &= (uint16_t)~0x0400u;"],
+    0xFF: [f"{_S0} = cos({_S0});", "c->fsw &= (uint16_t)~0x0400u;"],
+}
+
+
 class Emitter:
     def __init__(self, fn: Func, d: disasm.Disasm, whole: bool = False, lifted: set[int] | None = None):
         self.fn, self.d, self.whole = fn, d, whole
@@ -228,6 +303,10 @@ class Emitter:
         m = int(MASK[bits][:-1], 16) << sh
         return f"{p} = ({p} & 0x{~m & 0xFFFFFFFF:X}u) | ((((uint32_t)({val})) & {MASK[bits]}) << {sh});"
 
+    def patched(self, kind: str):
+        cur = getattr(self, "cur", None)
+        return PATCHED.get(cur.addr, {}).get(kind) if cur is not None else None
+
     def addr(self, op, offset: int = 0) -> str:
         m = op.mem
         parts = []
@@ -239,6 +318,14 @@ class Emitter:
         if m.index:
             idx = self.reg_read(m.index)[0]
             parts.append(f"{idx}*{m.scale}u" if m.scale != 1 else idx)
+        pd = self.patched("disp")
+        if pd:                                  # displacement rewritten at run time
+            off, size = pd
+            at = self.cur.addr + off
+            parts.append(f"rd32(c, 0x{at:X}u)" if size == 4 else f"(uint32_t)(int32_t)(int8_t)rd8(c, 0x{at:X}u)")
+            if offset:
+                parts.append(f"0x{offset & 0xFFFFFFFF:X}u")
+            return f"(uint32_t)({' + '.join(parts)})"
         disp = (m.disp + offset) & 0xFFFFFFFF
         if disp or not parts:
             parts.append(f"0x{disp:X}u")
@@ -249,6 +336,13 @@ class Emitter:
             return self.reg_read(op.reg)[0]
         if op.type == x86.X86_OP_IMM:
             b = bits or op.size * 8
+            pi = self.patched("imm")
+            if pi:                              # immediate rewritten at run time
+                off, size = pi
+                at = self.cur.addr + off
+                raw = {1: f"(uint32_t)(int32_t)(int8_t)rd8(c, 0x{at:X}u)", 2: f"(uint32_t)(int32_t)(int16_t)rd16(c, 0x{at:X}u)",
+                       4: f"rd32(c, 0x{at:X}u)"}[size]
+                return f"({raw} & {MASK[b]})"
             return f"0x{op.imm & int(MASK[b][:-1], 16):X}u"
         if op.type == x86.X86_OP_MEM:
             return f"rd{op.size * 8}(c, {self.addr(op)})"
@@ -318,7 +412,15 @@ class Emitter:
             return self.string_op(i)
         if rep_prefix(i) is not None and iid != x86.X86_INS_RET:
             return self.unsupported(i, f"rep prefix: {i.mnemonic}")
+        if FPU and x87_opcode(i) is not None:
+            return self.fpu(i)
         if iid in NO_OPS:
+            return []
+        if iid == x86.X86_INS_MOV and any(op.type == x86.X86_OP_REG and op.reg in CONTROL for op in ops):
+            # The DOS extender's FPU set-up reads and writes CR0: report PE | ET
+            # (protected mode, coprocessor present) and ignore writes.
+            if ops[1].type == x86.X86_OP_REG and ops[1].reg in CONTROL:
+                return [self.write(ops[0], "0x00000011u")]
             return []
         if iid == x86.X86_INS_MOV:
             return [self.write(ops[0], self.read(ops[1], ops[0].size * 8))]
@@ -439,6 +541,38 @@ class Emitter:
             # Behave like a 386 without a coprocessor: these do nothing, so the
             # CRT's probe (fninit; fnstcw) reads back 0 and never uses the FPU.
             return []
+        if iid in (x86.X86_INS_SHRD, x86.X86_INS_SHLD) and ops[0].size == 4:
+            # double shift: bits come in from the second operand; count mod 32, 0 = no change
+            n = self.read(ops[2], 8) if ops[2].type != x86.X86_OP_IMM else f"{ops[2].imm & 31}u"
+            a, b = self.read(ops[0]), self.read(ops[1])
+            if iid == x86.X86_INS_SHRD:
+                res, out = "(d >> n) | (s << (32 - n))", "(d >> (n - 1)) & 1u"
+            else:
+                res, out = "(d << n) | (s >> (32 - n))", "(d >> (32 - n)) & 1u"
+            return ["{", f"uint32_t n = ({n}) & 31u, d = {a}, s = {b};", "if (n) {",
+                    f"uint32_t r = {res};", f"f.cf = {out};", "f.zf = r == 0; f.sf = r >> 31; f.pf = parity8(r);",
+                    "f.of = ((r ^ d) >> 31) & 1u;", self.write(ops[0], "r"), "}", "}"]
+        if iid in (x86.X86_INS_BSR, x86.X86_INS_BSF):
+            src = self.read(ops[1], ops[1].size * 8)
+            fn = "31u - (uint32_t)__builtin_clz(v)" if iid == x86.X86_INS_BSR else "(uint32_t)__builtin_ctz(v)"
+            return ["{", f"uint32_t v = {src};", "f.zf = v == 0;", f"if (v) {{ {self.write(ops[0], fn)} }}", "}"]
+        if iid == x86.X86_INS_ENTER:
+            size, level = ops[0].imm & 0xFFFF, ops[1].imm & 31
+            if level:
+                return self.unsupported(i, "enter with nesting level")
+            return ["esp -= 4; wr32(c, esp, ebp);", "ebp = esp;", f"esp -= {size}u;"]
+        if iid == x86.X86_INS_AAM:
+            base = ops[0].imm & 0xFF if ops else 10
+            if not base:
+                return [f"x86_stop(c, STOP_DIVIDE, 0x{i.addr:X}u);"]
+            return ["{", "uint32_t al = eax & 0xFFu;", f"uint32_t q = al / {base}u, r = al % {base}u;",
+                    self.reg_write(x86.X86_REG_AX, "(q << 8) | r"), "f.zf = r == 0; f.sf = (r >> 7) & 1u; f.pf = parity8(r);", "}"]
+        if iid == x86.X86_INS_ARPL:
+            return ["f.zf = 0;"]                    # flat selectors: never adjusted
+        if iid == x86.X86_INS_SMSW:
+            return [self.write(ops[0], "0x0011u")]   # PE | ET: protected mode, FPU present
+        if iid in (x86.X86_INS_SIDT, x86.X86_INS_SGDT):
+            return [f"wr16(c, {self.addr(ops[0])}, 0u);", f"wr32(c, {self.addr(ops[0], 2)}, 0u);"]
         if iid == x86.X86_INS_INT3:
             return self.unsupported(i, "int3")
         if iid in (x86.X86_INS_IN, x86.X86_INS_OUT):
@@ -473,6 +607,87 @@ class Emitter:
             return ["c->ret_to = rd32(c, esp);", "x86_unpack_flags(&f, rd32(c, esp + 8));",
                     "esp += 12u;"] + self.leave()
         return self.unsupported(i, f"instruction {i.mnemonic} {i.op_str}")
+
+    # ---- x87 ------------------------------------------------------------------------
+    def fpu(self, i: disasm.Insn) -> list[str]:
+        """x87 instructions, decoded from the opcode and ModRM bytes (see runtime/x86.h)."""
+        k = x87_opcode(i)
+        op, modrm = i.bytes[k], i.bytes[k + 1]
+        reg, rm = modrm >> 3 & 7, modrm & 7
+        st = lambda n: f"FST(c, {n})"
+        if modrm < 0xC0:                        # memory operand
+            mem = next(o for o in i.ops if o.type == x86.X86_OP_MEM)
+            a = self.addr(mem)
+            if op in (0xD8, 0xDC, 0xDA, 0xDE):  # ST(0) op= m32fp / m64fp / m32int / m16int
+                src = {0xD8: f"rdf32(c, {a})", 0xDC: f"rdf64(c, {a})",
+                       0xDA: f"(double)(int32_t)rd32(c, {a})", 0xDE: f"(double)(int16_t)rd16(c, {a})"}[op]
+                return ["{", f"double x = {src};", *X87_ARITH[reg]("FST(c, 0)", "x", "FST(c, 0)"), "}"]
+            table = {
+                (0xD9, 0): [f"fpush(c, rdf32(c, {a}));"],
+                (0xD9, 2): [f"wrf32(c, {a}, {st(0)});"],
+                (0xD9, 3): [f"wrf32(c, {a}, {st(0)});", "fpop(c);"],
+                (0xD9, 4): [f"x86_fldenv(c, {a});"],
+                (0xD9, 5): [f"c->fcw = (uint16_t)rd16(c, {a});"],
+                (0xD9, 6): [f"x86_fnstenv(c, {a});"],
+                (0xD9, 7): [f"wr16(c, {a}, c->fcw);"],
+                (0xDB, 0): [f"fpush(c, (double)(int32_t)rd32(c, {a}));"],
+                (0xDB, 2): [f"wr32(c, {a}, fist32(c, {st(0)}));"],
+                (0xDB, 3): [f"wr32(c, {a}, fist32(c, {st(0)}));", "fpop(c);"],
+                (0xDB, 5): [f"fpush(c, rdf80(c, {a}));"],
+                (0xDB, 7): [f"wrf80(c, {a}, {st(0)});", "fpop(c);"],
+                (0xDD, 0): [f"fpush(c, rdf64(c, {a}));"],
+                (0xDD, 2): [f"wrf64(c, {a}, {st(0)});"],
+                (0xDD, 3): [f"wrf64(c, {a}, {st(0)});", "fpop(c);"],
+                (0xDD, 4): [f"x86_frstor(c, {a});"],
+                (0xDD, 6): [f"x86_fnsave(c, {a});"],
+                (0xDD, 7): [f"wr16(c, {a}, x86_fstsw(c));"],
+                (0xDF, 0): [f"fpush(c, (double)(int16_t)rd16(c, {a}));"],
+                (0xDF, 2): [f"wr16(c, {a}, fist16(c, {st(0)}));"],
+                (0xDF, 3): [f"wr16(c, {a}, fist16(c, {st(0)}));", "fpop(c);"],
+                (0xDF, 5): [f"fpush(c, (double)(int64_t)rd64(c, {a}));"],
+                (0xDF, 7): [f"wr64(c, {a}, fist64(c, {st(0)}));", "fpop(c);"],
+            }
+            if (op, reg) in table:
+                return table[(op, reg)]
+            return self.unsupported(i, f"x87 {i.mnemonic} {i.op_str}")
+        if op == 0xD8:                          # ST(0) op= ST(i)
+            return ["{", f"double x = {st(rm)};", *X87_ARITH[reg]("FST(c, 0)", "x", "FST(c, 0)"), "}"]
+        if op in (0xDC, 0xDE):                  # ST(i) op= ST(0), DE pops
+            pop = ["fpop(c);"] if op == 0xDE else []
+            if op == 0xDE and modrm == 0xD9:
+                return [f"fcom(c, {st(0)}, {st(1)});", "fpop(c);", "fpop(c);"]
+            if reg in (2, 3):
+                return X87_ARITH[reg]("FST(c, 0)", st(rm), "FST(c, 0)") + pop
+            # DC E0+i is FSUBR ST(i), ST(0) = ST(0) - ST(i); DC E8+i is FSUB = ST(i) - ST(0); same for div
+            expr = {0: f"{st(rm)} + {st(0)}", 1: f"{st(rm)} * {st(0)}", 4: f"{st(0)} - {st(rm)}",
+                    5: f"{st(rm)} - {st(0)}", 6: f"{st(0)} / {st(rm)}", 7: f"{st(rm)} / {st(0)}"}[reg]
+            return [f"{st(rm)} = {expr};"] + pop
+        if op == 0xD9:
+            if reg == 0:
+                return ["{", f"double x = {st(rm)};", "fpush(c, x);", "}"]
+            if reg == 1:
+                return ["{", f"double x = {st(0)};", f"{st(0)} = {st(rm)};", f"{st(rm)} = x;", "}"]
+            if modrm in X87_D9:
+                return X87_D9[modrm]
+        if op == 0xDD:
+            if reg == 0:                        # ffree: tags are not kept
+                return []
+            if reg in (2, 3):
+                return [f"{st(rm)} = {st(0)};"] + (["fpop(c);"] if reg == 3 else [])
+            if reg in (4, 5):                   # fucom / fucomp
+                return [f"fcom(c, {st(0)}, {st(rm)});"] + (["fpop(c);"] if reg == 5 else [])
+        if op == 0xDA and modrm == 0xE9:        # fucompp
+            return [f"fcom(c, {st(0)}, {st(1)});", "fpop(c);", "fpop(c);"]
+        if op == 0xDB:
+            if modrm == 0xE2:
+                return ["c->fsw &= 0x7F00u;"]   # fnclex
+            if modrm == 0xE3:
+                return ["x86_fninit(c);"]
+            if modrm in (0xE0, 0xE1, 0xE4):     # feni, fdisi, fsetpm: 8087/287 leftovers
+                return []
+        if op == 0xDF and modrm == 0xE0:
+            return [self.reg_write(x86.X86_REG_AX, "x86_fstsw(c)")]
+        return self.unsupported(i, f"x87 {i.mnemonic} {i.op_str}")
 
     def indirect_jump(self, i: disasm.Insn) -> list[str]:
         tgt = self.read(i.ops[0], 32)
@@ -596,6 +811,7 @@ class Emitter:
         order = sorted(fn.insns)
         for k, a in enumerate(order):
             i = fn.insns[a]
+            self.cur = i
             lines = self.lift(i)
             label = f"L_{a:x}:" if a in fn.targets or a == fn.addr else ""
             body.append(f"{label} /* {a:08x}: {i.mnemonic} {i.op_str} */")
@@ -699,11 +915,67 @@ def leaf_game_functions(d: disasm.Disasm, delta: int = 0) -> list[int]:
     return out
 
 
+def find_patched(d: disasm.Disasm) -> list[int]:
+    """Fill PATCHED from the program's writes into decoded instructions.
+    Returns the addresses of instructions whose opcode bytes are rewritten
+    (not handled: reported for a manual look)."""
+    from capstone import CS_ARCH_X86, CS_MODE_32, Cs
+    import bisect
+    cs = Cs(CS_ARCH_X86, CS_MODE_32)
+    cs.detail = True
+    starts = sorted(d.insns)
+    opcode = []
+    for t, refs in d.code_refs.items():
+        if not any(k == "write" for _, k in refs):
+            continue
+        k = bisect.bisect_right(starts, t) - 1
+        if k < 0:
+            continue
+        i = d.insns[starts[k]]
+        if not i.addr <= t < i.end:
+            continue                            # data kept in the code object: an ordinary variable
+        ci = next(cs.disasm(i.bytes, i.addr, 1))
+        entry = PATCHED.setdefault(i.addr, {})
+        rel = t - i.addr
+        if ci.imm_size and ci.imm_offset <= rel < ci.imm_offset + ci.imm_size:
+            entry["imm"] = (ci.imm_offset, ci.imm_size)
+        elif ci.disp_size and ci.disp_offset <= rel < ci.disp_offset + ci.disp_size:
+            entry["disp"] = (ci.disp_offset, ci.disp_size)
+        else:
+            opcode.append(i.addr)
+            if not entry:
+                del PATCHED[i.addr]
+    # Unrolled loops patch every copy through an index register ([edi + 0x3A9FE]
+    # with edi stepping by the copy's size), so only the first copy has a
+    # constant address.  Copies with the same bytes nearby get the same
+    # treatment; reading an operand that never changes costs only speed.
+    for t, entry in list(PATCHED.items()):
+        raw = d.insns[t].bytes
+        lo, hi = bisect.bisect_left(starts, t - UNROLL_SPAN), bisect.bisect_right(starts, t + UNROLL_SPAN)
+        for a in starts[lo:hi]:
+            if a not in PATCHED and d.insns[a].bytes == raw:
+                PATCHED[a] = dict(entry)
+    return sorted(set(opcode))
+
+
+def load_profile(path: pathlib.Path) -> None:
+    """A game's own HLE / WRAP / PATCH_OPERANDS (see the top of this file)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("profile", path)
+    prof = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prof)
+    global HLE, WRAP, PATCH_OPERANDS, FPU
+    HLE = dict(getattr(prof, "HLE", {}))
+    WRAP = dict(getattr(prof, "WRAP", {}))
+    PATCH_OPERANDS = bool(getattr(prof, "PATCH_OPERANDS", False))
+    FPU = bool(getattr(prof, "FPU", False))
+
+
 def write_c(path: pathlib.Path, funcs: dict[int, str]) -> None:
     protos = "\n".join(f"void f_{a:x}(Cpu *c);" for a in sorted(funcs))
     table = "\n".join(f"    {{0x{a:X}u, f_{a:x}}}," for a in sorted(funcs))
     path.write_text(
-        "/* Generated by recomp/tools/lift.py from war.exe. Do not edit. */\n"
+        f"/* Generated by recomp/tools/lift.py from {EXE_NAME}. Do not edit. */\n"
         '#include "x86.h"\n\n'
         "#pragma clang diagnostic ignored \"-Wunused-label\"\n"
         "#pragma clang diagnostic ignored \"-Wunused-variable\"\n"
@@ -721,21 +993,39 @@ def parse_bases(spec: str) -> dict[int, int]:
     return {int(k): int(v, 0) for k, v in (kv.split("=") for kv in spec.split(","))}
 
 
+EXE_NAME = DEFAULT_EXE.name
+
+
 def main() -> None:
+    global EXE_NAME
     out = pathlib.Path(sys.argv[1])
     args = sys.argv[2:]
+    exe = DEFAULT_EXE
+    if "--exe" in args:                         # another game's executable
+        i = args.index("--exe")
+        exe = pathlib.Path(args[i + 1])
+        del args[i:i + 2]
+    if "--profile" in args:
+        i = args.index("--profile")
+        load_profile(pathlib.Path(args[i + 1]))
+        del args[i:i + 2]
+    EXE_NAME = exe.name
     bases = {}
     if "--bases" in args:
         i = args.index("--bases")
         bases = parse_bases(args[i + 1])
         del args[i:i + 2]
-    raw = DEFAULT_EXE.read_bytes()
+    raw = exe.read_bytes()
     mod = LEModule(raw, bases)
     code = next(o for o in mod.objects if o.is_code)
     # Addresses on the command line are image addresses; shift them to where
     # the code object was loaded.
     delta = code.base - next(o for o in LEModule(raw).objects if o.is_code).base
     d = disasm.build(mod)
+    if PATCH_OPERANDS:
+        opcode = find_patched(d)
+        print(f"self-modified operands in {len(PATCHED)} instructions; opcode rewrites (not handled) at "
+              f"{', '.join(hex(a) for a in opcode) or 'none'}")
     if args == ["--all"]:
         done, skipped = lift_whole(d)
     else:

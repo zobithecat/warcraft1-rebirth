@@ -1420,7 +1420,7 @@ static void on_hle(Cpu *c, uint32_t func) {
     }
 }
 
-static const Hooks HOOKS = { on_int, on_in, on_out, dispatch, on_trap, sel_base, on_hle, on_wrap };
+static const Hooks HOOKS = { on_int, on_in, on_out, dispatch, on_trap, sel_base, on_hle, on_wrap, NULL, NULL, NULL };
 
 /* ---- checkpoint dumps (debugging; RECOMP_TRACE builds) ------------------------------ */
 #ifdef RECOMP_TRACE

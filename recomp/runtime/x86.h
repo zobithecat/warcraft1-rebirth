@@ -7,6 +7,7 @@
 #ifndef RECOMP_X86_H
 #define RECOMP_X86_H
 
+#include <math.h>
 #include <setjmp.h>
 #include <stdint.h>
 #include <string.h>
@@ -37,6 +38,12 @@ typedef struct Hooks {
     uint32_t (*selector_base)(Cpu *c, uint16_t sel);            /* DPMI descriptor base */
     void (*hle)(Cpu *c, uint32_t func);                          /* function replaced by the runtime */
     int (*wrap)(Cpu *c, uint32_t func);       /* lift.py WRAP: nonzero = handled, original skipped */
+    /* Memory-mapped device in [mmio_lo, mmio_hi) (e.g. planar VGA memory). */
+    uint32_t (*mmio_read)(Cpu *c, uint32_t addr, int bytes);
+    void (*mmio_write)(Cpu *c, uint32_t addr, uint32_t value, int bytes);
+    /* Called when the branch budget runs out instead of stopping: the runtime
+     * delivers timer interrupts here and sets a new budget. */
+    void (*budget)(Cpu *c, uint32_t at);
 } Hooks;
 
 struct Cpu {
@@ -54,6 +61,10 @@ struct Cpu {
     const Hooks *hooks;
     void *host;             /* runtime state */
     uint32_t bad_call, bad_expect;   /* details of the last STOP_BADRET */
+    uint32_t mmio_lo, mmio_hi;       /* accesses here go to hooks->mmio_* (empty: none) */
+    double st[8];           /* x87 registers (double precision), ST(i) = st[(ftop + i) & 7] */
+    uint32_t ftop;
+    uint16_t fsw, fcw;      /* status word without TOP; control word */
 #ifdef RECOMP_TRACE
     uint32_t trail[64];     /* most recently entered functions (ring) */
     uint32_t trail_pos;
@@ -92,9 +103,25 @@ static inline uint8_t *x86_ptr(Cpu *c, uint32_t a, uint32_t n) {
     return c->mem + a;
 }
 
-static inline uint32_t rd8(Cpu *c, uint32_t a) { return *x86_ptr(c, a, 1); }
-static inline uint32_t rd16(Cpu *c, uint32_t a) { uint16_t v; memcpy(&v, x86_ptr(c, a, 2), 2); return v; }
-static inline uint32_t rd32(Cpu *c, uint32_t a) { uint32_t v; memcpy(&v, x86_ptr(c, a, 4), 4); return v; }
+/* Games built with -DX86_HAVE_MMIO route [mmio_lo, mmio_hi) to the runtime;
+ * others pay nothing for it. */
+#ifdef X86_HAVE_MMIO
+#define X86_MMIO(c, a) ((a) < (c)->mmio_hi && (a) >= (c)->mmio_lo)
+#else
+#define X86_MMIO(c, a) 0
+#endif
+static inline uint32_t rd8(Cpu *c, uint32_t a) {
+    if (X86_MMIO(c, a)) return c->hooks->mmio_read(c, a, 1);
+    return *x86_ptr(c, a, 1);
+}
+static inline uint32_t rd16(Cpu *c, uint32_t a) {
+    if (X86_MMIO(c, a)) return c->hooks->mmio_read(c, a, 2);
+    uint16_t v; memcpy(&v, x86_ptr(c, a, 2), 2); return v;
+}
+static inline uint32_t rd32(Cpu *c, uint32_t a) {
+    if (X86_MMIO(c, a)) return c->hooks->mmio_read(c, a, 4);
+    uint32_t v; memcpy(&v, x86_ptr(c, a, 4), 4); return v;
+}
 #ifdef RECOMP_TRACE
 void x86_on_watch(Cpu *c, uint32_t addr, uint32_t n);   /* runtime: WAR_WATCH hit */
 #endif
@@ -105,12 +132,24 @@ static inline uint8_t *x86_wptr(Cpu *c, uint32_t a, uint32_t n) {
 #endif
     return x86_ptr(c, a, n);
 }
-static inline void wr8(Cpu *c, uint32_t a, uint32_t v) { *x86_wptr(c, a, 1) = (uint8_t)v; }
-static inline void wr16(Cpu *c, uint32_t a, uint32_t v) { uint16_t x = (uint16_t)v; memcpy(x86_wptr(c, a, 2), &x, 2); }
-static inline void wr32(Cpu *c, uint32_t a, uint32_t v) { memcpy(x86_wptr(c, a, 4), &v, 4); }
+static inline void wr8(Cpu *c, uint32_t a, uint32_t v) {
+    if (X86_MMIO(c, a)) { c->hooks->mmio_write(c, a, v, 1); return; }
+    *x86_wptr(c, a, 1) = (uint8_t)v;
+}
+static inline void wr16(Cpu *c, uint32_t a, uint32_t v) {
+    if (X86_MMIO(c, a)) { c->hooks->mmio_write(c, a, v, 2); return; }
+    uint16_t x = (uint16_t)v; memcpy(x86_wptr(c, a, 2), &x, 2);
+}
+static inline void wr32(Cpu *c, uint32_t a, uint32_t v) {
+    if (X86_MMIO(c, a)) { c->hooks->mmio_write(c, a, v, 4); return; }
+    memcpy(x86_wptr(c, a, 4), &v, 4);
+}
 
 static inline void x86_tick(Cpu *c, uint32_t at) {
-    if (--c->budget < 0) x86_stop(c, STOP_BUDGET, at);
+    if (--c->budget < 0) {
+        if (c->hooks && c->hooks->budget) c->hooks->budget(c, at);
+        else x86_stop(c, STOP_BUDGET, at);
+    }
 }
 
 static inline uint8_t parity8(uint32_t v) { return !__builtin_parity(v & 0xFF); }
@@ -245,6 +284,113 @@ static inline uint32_t imul32(Flags *f, uint32_t a, uint32_t b) {
 static inline uint32_t imul16(Flags *f, uint32_t a, uint32_t b) {
     int32_t w = (int32_t)(int16_t)a * (int16_t)b; int16_t r = (int16_t)w;
     f->cf = f->of = w != r; return (uint16_t)r;
+}
+
+/* ---- x87 (lift.py FPU = True) ---------------------------------------------
+ * Registers are doubles, not 80-bit extended: enough for game arithmetic.
+ * Exceptions stay masked (results are inf/NaN like a masked 387); the status
+ * word keeps C0-C3, TOP is kept apart in ftop. */
+#define FST(c, i) ((c)->st[((c)->ftop + (uint32_t)(i)) & 7])
+static inline void fpush(Cpu *c, double v) { c->ftop = (c->ftop - 1) & 7; c->st[c->ftop] = v; }
+static inline void fpop(Cpu *c) { c->ftop = (c->ftop + 1) & 7; }
+static inline void x86_fninit(Cpu *c) { c->fcw = 0x037F; c->fsw = 0; c->ftop = 0; }
+static inline uint32_t x86_fstsw(Cpu *c) { return (c->fsw & ~0x3800u) | (c->ftop & 7) << 11; }
+/* compare: C3 C2 C0 = 000 greater, 001 less, 100 equal, 111 unordered */
+static inline void fcom(Cpu *c, double a, double b) {
+    c->fsw &= (uint16_t)~0x4500u;
+    if (a != a || b != b) c->fsw |= 0x4500;
+    else if (a < b) c->fsw |= 0x0100;
+    else if (a == b) c->fsw |= 0x4000;
+}
+static inline void fxam(Cpu *c, double v) {
+    c->fsw &= (uint16_t)~0x4700u;
+    if (signbit(v)) c->fsw |= 0x0200;
+    switch (fpclassify(v)) {
+    case FP_NAN: c->fsw |= 0x0100; break;
+    case FP_INFINITE: c->fsw |= 0x0500; break;
+    case FP_ZERO: c->fsw |= 0x4000; break;
+    case FP_SUBNORMAL: c->fsw |= 0x4400; break;
+    default: c->fsw |= 0x0400; break;
+    }
+}
+static inline double fround(Cpu *c, double v) {      /* by the control word's rounding mode */
+    switch (c->fcw >> 10 & 3) {
+    case 0: { double r = floor(v + 0.5); return (r - v == 0.5 && fmod(r, 2.0) != 0) ? r - 1 : r; }
+    case 1: return floor(v);
+    case 2: return ceil(v);
+    default: return trunc(v);
+    }
+}
+static inline uint32_t fist16(Cpu *c, double v) {
+    double r = fround(c, v);
+    return r >= -32768.0 && r < 32768.0 ? (uint32_t)(uint16_t)(int16_t)r : 0x8000u;
+}
+static inline uint32_t fist32(Cpu *c, double v) {
+    double r = fround(c, v);
+    return r >= -2147483648.0 && r < 2147483648.0 ? (uint32_t)(int32_t)r : 0x80000000u;
+}
+static inline uint64_t fist64(Cpu *c, double v) {
+    double r = fround(c, v);
+    return r >= -9223372036854775808.0 && r < 9223372036854775808.0 ? (uint64_t)(int64_t)r : 0x8000000000000000ull;
+}
+static inline double rdf32(Cpu *c, uint32_t a) { uint32_t v = rd32(c, a); float f; memcpy(&f, &v, 4); return f; }
+static inline double rdf64(Cpu *c, uint32_t a) {
+    uint64_t v = rd32(c, a) | (uint64_t)rd32(c, a + 4) << 32; double d; memcpy(&d, &v, 8); return d;
+}
+static inline void wrf32(Cpu *c, uint32_t a, double d) { float f = (float)d; uint32_t v; memcpy(&v, &f, 4); wr32(c, a, v); }
+static inline void wrf64(Cpu *c, uint32_t a, double d) {
+    uint64_t v; memcpy(&v, &d, 8); wr32(c, a, (uint32_t)v); wr32(c, a + 4, (uint32_t)(v >> 32));
+}
+static inline uint64_t rd64(Cpu *c, uint32_t a) { return rd32(c, a) | (uint64_t)rd32(c, a + 4) << 32; }
+static inline void wr64(Cpu *c, uint32_t a, uint64_t v) { wr32(c, a, (uint32_t)v); wr32(c, a + 4, (uint32_t)(v >> 32)); }
+/* 80-bit extended <-> double */
+static inline double rdf80(Cpu *c, uint32_t a) {
+    uint64_t m = rd64(c, a);
+    uint32_t se = rd16(c, a + 8);
+    int e = (int)(se & 0x7FFF);
+    double d;
+    if (e == 0x7FFF) d = (m << 1) ? NAN : INFINITY;
+    else d = ldexp((double)m, e - 16383 - 63);
+    return (se & 0x8000) ? -d : d;
+}
+static inline void wrf80(Cpu *c, uint32_t a, double d) {
+    uint32_t se = signbit(d) ? 0x8000u : 0;
+    uint64_t m = 0;
+    d = fabs(d);
+    if (d != d) { se |= 0x7FFF; m = 0xC000000000000000ull; }
+    else if (isinf(d)) { se |= 0x7FFF; m = 0x8000000000000000ull; }
+    else if (d != 0) {
+        int e;
+        double fr = frexp(d, &e);                      /* d = fr * 2^e, fr in [0.5, 1) */
+        m = (uint64_t)ldexp(fr, 64);
+        se |= (uint32_t)(e - 1 + 16383) & 0x7FFF;
+    }
+    wr64(c, a, m);
+    wr16(c, a + 8, se);
+}
+/* fnsave / frstor, 32-bit protected-mode layout: 28-byte environment, then ST(0..7) */
+static inline void x86_fnsave(Cpu *c, uint32_t a) {
+    wr32(c, a, c->fcw); wr32(c, a + 4, x86_fstsw(c)); wr32(c, a + 8, 0);
+    for (uint32_t k = 12; k < 28; k += 4) wr32(c, a + k, 0);
+    for (int i = 0; i < 8; i++) wrf80(c, a + 28 + 10 * (uint32_t)i, FST(c, i));
+    x86_fninit(c);
+}
+static inline void x86_frstor(Cpu *c, uint32_t a) {
+    c->fcw = (uint16_t)rd32(c, a);
+    uint32_t sw = rd32(c, a + 4);
+    c->fsw = (uint16_t)(sw & ~0x3800u);
+    c->ftop = sw >> 11 & 7;
+    for (int i = 0; i < 8; i++) FST(c, i) = rdf80(c, a + 28 + 10 * (uint32_t)i);
+}
+static inline void x86_fnstenv(Cpu *c, uint32_t a) {
+    wr32(c, a, c->fcw); wr32(c, a + 4, x86_fstsw(c)); wr32(c, a + 8, 0);
+    for (uint32_t k = 12; k < 28; k += 4) wr32(c, a + k, 0);
+}
+static inline void x86_fldenv(Cpu *c, uint32_t a) {
+    c->fcw = (uint16_t)rd32(c, a);
+    uint32_t sw = rd32(c, a + 4);
+    c->fsw = (uint16_t)(sw & ~0x3800u);
+    c->ftop = sw >> 11 & 7;
 }
 
 #endif
