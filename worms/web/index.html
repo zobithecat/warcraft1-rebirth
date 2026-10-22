@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Worms (wasm)</title>
+<style>
+  :root { --bg: #111; --fg: #ccc; --dim: #777; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.4 ui-monospace, Menlo, monospace; }
+  main { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 16px; }
+  canvas { width: min(960px, calc(100vw - 32px)); aspect-ratio: 320 / 200; image-rendering: pixelated;
+           background: #000; cursor: none; outline: none; }
+  #status { color: var(--dim); min-height: 1.4em; }
+  #log { width: min(960px, calc(100vw - 32px)); max-height: 8em; overflow: auto; margin: 0; color: var(--dim);
+         white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="screen" width="320" height="200" tabindex="0"></canvas>
+  <div id="status">loading…</div>
+  <pre id="log"></pre>
+</main>
+<script>
+// The page only draws frames and forwards input; the game runs in worker.js.
+const canvas = document.getElementById("screen");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("log");
+const log = (s) => { logEl.textContent += s + "\n"; logEl.scrollTop = logEl.scrollHeight; };
+
+if (!crossOriginIsolated) {
+  statusEl.textContent = "SharedArrayBuffer unavailable: serve with tools/serve.py (needs COOP/COEP headers).";
+  throw new Error("not cross-origin isolated");
+}
+
+// Input ring shared with the worker: [head, tail, 256 x {type, a, b, c}].
+const ring = new Int32Array(new SharedArrayBuffer(4 * (2 + 256 * 4)));
+function send(type, a, b, c) {
+  const head = Atomics.load(ring, 0);
+  if (head - Atomics.load(ring, 1) >= 256) return;           // game is not reading: drop
+  const at = 2 + (head & 255) * 4;
+  ring[at] = type; ring[at + 1] = a; ring[at + 2] = b; ring[at + 3] = c;
+  Atomics.store(ring, 0, head + 1);
+}
+
+// Audio ring filled by the worker, played by audio.js: 0.25 s of float32 stereo
+// (silence until the Sound Blaster and CD audio are emulated).
+const AUDIO_RATE = 48000;
+const audioBuf = new SharedArrayBuffer(4 * 2 * (AUDIO_RATE / 4));
+const audioIdx = new SharedArrayBuffer(4 * 2);
+let audioStarted = false;
+// Browsers start sound only after a user gesture, so the first click or key does it.
+async function startAudio() {
+  if (audioStarted) return;
+  audioStarted = true;
+  try {
+    const ctx = new AudioContext({ sampleRate: AUDIO_RATE });
+    await ctx.audioWorklet.addModule("audio.js");
+    const node = new AudioWorkletNode(ctx, "war-audio", {
+      outputChannelCount: [2], processorOptions: { buf: audioBuf, idx: audioIdx },
+    });
+    node.connect(ctx.destination);
+    await ctx.resume();
+  } catch (err) {
+    log("audio: " + err);
+  }
+}
+window.addEventListener("pointerdown", startAudio);
+window.addEventListener("keydown", startAudio);
+
+// KeyboardEvent.code -> PC set-1 scancode (same keys as the native build).
+const SCAN = {
+  Escape: 0x01, Digit1: 0x02, Digit2: 0x03, Digit3: 0x04, Digit4: 0x05, Digit5: 0x06, Digit6: 0x07,
+  Digit7: 0x08, Digit8: 0x09, Digit9: 0x0A, Digit0: 0x0B, Minus: 0x0C, Equal: 0x0D, Backspace: 0x0E, Tab: 0x0F,
+  KeyQ: 0x10, KeyW: 0x11, KeyE: 0x12, KeyR: 0x13, KeyT: 0x14, KeyY: 0x15, KeyU: 0x16, KeyI: 0x17, KeyO: 0x18,
+  KeyP: 0x19, BracketLeft: 0x1A, BracketRight: 0x1B, Enter: 0x1C, ControlLeft: 0x1D, ControlRight: 0x1D,
+  KeyA: 0x1E, KeyS: 0x1F, KeyD: 0x20, KeyF: 0x21, KeyG: 0x22, KeyH: 0x23, KeyJ: 0x24, KeyK: 0x25, KeyL: 0x26,
+  Semicolon: 0x27, Quote: 0x28, Backquote: 0x29, ShiftLeft: 0x2A, Backslash: 0x2B,
+  KeyZ: 0x2C, KeyX: 0x2D, KeyC: 0x2E, KeyV: 0x2F, KeyB: 0x30, KeyN: 0x31, KeyM: 0x32, Comma: 0x33, Period: 0x34,
+  Slash: 0x35, ShiftRight: 0x36, AltLeft: 0x38, AltRight: 0x38, Space: 0x39,
+  F1: 0x3B, F2: 0x3C, F3: 0x3D, F4: 0x3E, F5: 0x3F, F6: 0x40, F7: 0x41, F8: 0x42, F9: 0x43, F10: 0x44,
+  Home: 0x47, ArrowUp: 0x48, PageUp: 0x49, ArrowLeft: 0x4B, ArrowRight: 0x4D, End: 0x4F, ArrowDown: 0x50,
+  PageDown: 0x51, Insert: 0x52, Delete: 0x53,
+};
+function key(e, up) {
+  const s = SCAN[e.code];
+  if (!s) return;
+  e.preventDefault();
+  if (!e.repeat) send(1, up ? s | 0x80 : s, 0, 0);
+}
+canvas.addEventListener("keydown", (e) => key(e, false));
+canvas.addEventListener("keyup", (e) => key(e, true));
+
+// Pointer position in 1/65536ths of the canvas; c = button (1 left, 2 right, 4 middle) | down << 3.
+function mouse(e, button, down) {
+  const r = canvas.getBoundingClientRect();
+  const fx = Math.min(65535, Math.max(0, Math.floor((e.clientX - r.left) / r.width * 65536)));
+  const fy = Math.min(65535, Math.max(0, Math.floor((e.clientY - r.top) / r.height * 65536)));
+  send(2, fx, fy, button | (down ? 8 : 0));
+}
+const BUTTON = [1, 4, 2];
+canvas.addEventListener("mousemove", (e) => mouse(e, 0, false));
+canvas.addEventListener("mousedown", (e) => { canvas.focus(); mouse(e, BUTTON[e.button] || 0, true); });
+canvas.addEventListener("mouseup", (e) => mouse(e, BUTTON[e.button] || 0, false));
+canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// ?input=... etc. become WAR_INPUT etc. (scripted runs, as with the native build)
+const env = {};
+for (const [k, v] of new URLSearchParams(location.search)) env["WAR_" + k.toUpperCase()] = v;
+
+let image = ctx.createImageData(320, 200);
+let frames = 0;
+const worker = new Worker("worker.js");
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.frame) {
+    if (m.w !== image.width || m.h !== image.height) {      // the game switched to another VGA mode
+      canvas.width = m.w; canvas.height = m.h;
+      canvas.style.aspectRatio = m.w + " / " + m.h;
+      image = ctx.createImageData(m.w, m.h);
+    }
+    image.data.set(new Uint8ClampedArray(m.frame));
+    ctx.putImageData(image, 0, 0);
+    if (frames++ === 0) { statusEl.textContent = "running — click the screen for keyboard focus (no sound yet)"; canvas.focus(); }
+  } else if (m.log !== undefined) {
+    log(m.log);
+  } else if (m.status !== undefined) {
+    if (!frames) statusEl.textContent = m.status || "starting…";
+  } else if (m.exit !== undefined) {
+    statusEl.textContent = "game exited (" + m.exit + ")";
+  }
+};
+worker.onerror = (e) => { statusEl.textContent = "worker error: " + e.message; };
+worker.postMessage({ ring: ring.buffer, env, audioBuf, audioIdx });
+</script>
+</body>
+</html>

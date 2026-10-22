@@ -12,13 +12,18 @@
  *   WAR_TRACE=1 worms ...              log every interrupt
  *   WAR_SNAPSHOT=s, WAR_INPUT=...      unattended runs (see run_script)
  *
- * Not yet: Sound Blaster and CD audio (silence), the FMV player (skipped),
- * the browser build.
+ * Built with Emscripten (make wasm) the same code runs in a browser Web
+ * Worker, as WarCraft's does (web/worker.js): frames go out by postMessage,
+ * input comes back through a SharedArrayBuffer ring.
+ *
+ * Not yet: Sound Blaster and CD audio (silence), the FMV player (skipped).
  */
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #else
 #include <SDL.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #endif
 #include <ctype.h>
 #include <dirent.h>
@@ -85,6 +90,8 @@ typedef struct {
     uint8_t dac[768];
     int dac_w, dac_wc, dac_r, dac_rc;
     uint32_t retrace;
+    uint64_t retrace_period;      /* 1/70 s periods since start; retrace_seen: reported in this one */
+    int retrace_seen;
     int video_on;
 #ifndef __EMSCRIPTEN__
     SDL_Window *win;
@@ -109,6 +116,12 @@ typedef struct {
 } Host;
 
 static Host H;
+
+/* Input from the window (or the page) in one form for both builds. */
+typedef struct {
+    int32_t type;          /* 1: key, a = PC scancode (| 0x80 released); 2: mouse; 3: quit */
+    int32_t a, b, c;       /* mouse: a, b = position as in mouse_input, c = button | down << 3 */
+} InputEvent;
 
 static uint64_t now_ns(void) {
     struct timespec ts;
@@ -181,11 +194,11 @@ static void call_guest(Cpu *c, uint32_t handler, int iret_frame) {
 
 /* ---- video ------------------------------------------------------------------- */
 #ifdef __EMSCRIPTEN__
-/* worker.js: send a 320x200 RGBA frame to the page */
-EM_JS(void, web_present, (const uint32_t *px), {
+/* worker.js: send a w x h RGBA frame to the page (320x200, or a tweaked mode's size) */
+EM_JS(void, web_present, (const uint32_t *px, int w, int h), {
     if (typeof postMessage !== "function") return;
-    const f = HEAPU8.slice(px, px + 320 * 200 * 4);
-    postMessage({ frame: f.buffer }, [f.buffer]);
+    const f = HEAPU8.slice(px, px + w * h * 4);
+    postMessage({ frame: f.buffer, w: w, h: h }, [f.buffer]);
 });
 /* worker.js: next input event from the page's ring, as {type, a, b, c} */
 EM_JS(int, web_poll, (int32_t *ev), {
@@ -204,13 +217,29 @@ static void video_init(void) { H.video_on = 1; }
 #else
 #define PIXEL(r, g, b) (0xFF000000u | (uint32_t)(r) << 16 | (uint32_t)(g) << 8 | (uint32_t)(b))   /* ARGB8888 */
 
-static void video_init(void) {
-    if (H.video_on) return;
-    H.video_on = 1;
+/* The game runs on its own thread and the main thread owns the window, like
+ * the browser build's worker and page: a present that blocks (Metal waits for
+ * a free drawable while the window is covered) then only delays the picture,
+ * never the game's retrace waits and palette fades.  Frames and input pass
+ * through UI under its lock. */
+static struct {
+    pthread_mutex_t lock;
+    uint32_t px[MAX_W * MAX_H];
+    int w, h;
+    unsigned frame;               /* bumped by every present */
+    InputEvent events[256];
+    unsigned head, tail;
+    atomic_int done;
+    int exit_code;
+} UI = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+static void video_init(void) { H.video_on = 1; }
+
+static void window_open(void) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) { fprintf(stderr, "SDL_Init: %s\n", SDL_GetError()); exit(1); }
     H.win = SDL_CreateWindow("Worms (native arm64)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                              320 * SCALE, 200 * SCALE, SDL_WINDOW_ALLOW_HIGHDPI);
-    H.ren = SDL_CreateRenderer(H.win, -1, SDL_RENDERER_ACCELERATED);
+    H.ren = SDL_CreateRenderer(H.win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     SDL_ShowCursor(SDL_DISABLE);
 }
 #endif
@@ -343,17 +372,13 @@ static void present(Cpu *c) {
     }
     for (int i = 0; i < w * h; i++) px[i] = lut[idx[i]];
 #ifdef __EMSCRIPTEN__
-    web_present(px);
+    web_present(px, w, h);
 #else
-    if (w != H.tex_w || h != H.tex_h) {
-        if (H.tex) SDL_DestroyTexture(H.tex);
-        H.tex = SDL_CreateTexture(H.ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
-        H.tex_w = w; H.tex_h = h;
-    }
-    SDL_UpdateTexture(H.tex, NULL, px, w * 4);
-    SDL_RenderClear(H.ren);
-    SDL_RenderCopy(H.ren, H.tex, NULL, NULL);
-    SDL_RenderPresent(H.ren);
+    pthread_mutex_lock(&UI.lock);
+    memcpy(UI.px, px, (size_t)(w * h) * 4);
+    UI.w = w; UI.h = h;
+    UI.frame++;
+    pthread_mutex_unlock(&UI.lock);
 #endif
 }
 
@@ -435,12 +460,6 @@ static void mouse_input(Cpu *c, uint32_t fx, uint32_t fy, int button, int down) 
     }
     mouse_event(c, mask);
 }
-
-/* Input from the window (or the page) in one form for both builds. */
-typedef struct {
-    int32_t type;          /* 1: key, a = PC scancode (| 0x80 released); 2: mouse; 3: quit */
-    int32_t a, b, c;       /* mouse: a, b = position as in mouse_input, c = button | down << 3 */
-} InputEvent;
 
 /* The game polls the buttons once per frame, so a press and release inside
  * one frame would not register: releases are held back until the button has
@@ -633,36 +652,71 @@ static void snapshot(Cpu *c, const char *path) {
 static int next_input(InputEvent *ev) { return web_poll(&ev->type); }
 #else
 static int next_input(InputEvent *ev) {
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        switch (e.type) {
-        case SDL_QUIT:
-            *ev = (InputEvent){ 3, 0, 0, 0 };
-            return 1;
-        case SDL_KEYDOWN: case SDL_KEYUP: {
-            if (e.key.repeat) break;
-            uint8_t s = pc_scancode(e.key.keysym.scancode);
-            if (!s) break;
-            *ev = (InputEvent){ 1, e.type == SDL_KEYUP ? s | 0x80 : s, 0, 0 };
-            return 1;
+    pthread_mutex_lock(&UI.lock);
+    int got = UI.head != UI.tail;
+    if (got) *ev = UI.events[UI.tail++ & 255];
+    pthread_mutex_unlock(&UI.lock);
+    return got;
+}
+
+static void ui_send(InputEvent ev) {
+    pthread_mutex_lock(&UI.lock);
+    if (UI.head - UI.tail < 256) UI.events[UI.head++ & 255] = ev;
+    pthread_mutex_unlock(&UI.lock);
+}
+
+/* Main thread: window events -> UI.events, UI.px -> window, until the game ends. */
+static void window_loop(void) {
+    static uint32_t px[MAX_W * MAX_H];
+    unsigned shown = 0;
+    while (!atomic_load(&UI.done)) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            switch (e.type) {
+            case SDL_QUIT:
+                ui_send((InputEvent){ 3, 0, 0, 0 });
+                break;
+            case SDL_KEYDOWN: case SDL_KEYUP: {
+                if (e.key.repeat) break;
+                uint8_t s = pc_scancode(e.key.keysym.scancode);
+                if (s) ui_send((InputEvent){ 1, e.type == SDL_KEYUP ? s | 0x80 : s, 0, 0 });
+                break;
+            }
+            case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
+                int wx, wy, ww, wh;
+                SDL_GetMouseState(&wx, &wy);
+                SDL_GetWindowSize(H.win, &ww, &wh);
+                if (wx < 0) wx = 0;
+                if (wy < 0) wy = 0;
+                uint32_t fx = ww ? (uint32_t)((uint64_t)wx * 65536 / (uint32_t)ww) : 0;
+                uint32_t fy = wh ? (uint32_t)((uint64_t)wy * 65536 / (uint32_t)wh) : 0;
+                int bit = 0;
+                if (e.type != SDL_MOUSEMOTION)
+                    bit = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_RIGHT ? 2 : 4;
+                ui_send((InputEvent){ 2, (int32_t)fx, (int32_t)fy, bit | (e.type == SDL_MOUSEBUTTONDOWN) << 3 });
+                break;
+            }
+            }
         }
-        case SDL_MOUSEMOTION: case SDL_MOUSEBUTTONDOWN: case SDL_MOUSEBUTTONUP: {
-            int wx, wy, ww, wh;
-            SDL_GetMouseState(&wx, &wy);
-            SDL_GetWindowSize(H.win, &ww, &wh);
-            if (wx < 0) wx = 0;
-            if (wy < 0) wy = 0;
-            uint32_t fx = ww ? (uint32_t)((uint64_t)wx * 65536 / (uint32_t)ww) : 0;
-            uint32_t fy = wh ? (uint32_t)((uint64_t)wy * 65536 / (uint32_t)wh) : 0;
-            int bit = 0;
-            if (e.type != SDL_MOUSEMOTION)
-                bit = e.button.button == SDL_BUTTON_LEFT ? 1 : e.button.button == SDL_BUTTON_RIGHT ? 2 : 4;
-            *ev = (InputEvent){ 2, (int32_t)fx, (int32_t)fy, bit | (e.type == SDL_MOUSEBUTTONDOWN) << 3 };
-            return 1;
+        int w = 0, h = 0;
+        pthread_mutex_lock(&UI.lock);
+        if (UI.frame != shown) {
+            shown = UI.frame;
+            w = UI.w; h = UI.h;
+            memcpy(px, UI.px, (size_t)(w * h) * 4);
         }
+        pthread_mutex_unlock(&UI.lock);
+        if (!w) { SDL_Delay(2); continue; }
+        if (w != H.tex_w || h != H.tex_h) {
+            if (H.tex) SDL_DestroyTexture(H.tex);
+            H.tex = SDL_CreateTexture(H.ren, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+            H.tex_w = w; H.tex_h = h;
         }
+        SDL_UpdateTexture(H.tex, NULL, px, w * 4);
+        SDL_RenderClear(H.ren);
+        SDL_RenderCopy(H.ren, H.tex, NULL, NULL);
+        SDL_RenderPresent(H.ren);
     }
-    return 0;
 }
 #endif
 
@@ -1287,14 +1341,20 @@ static uint32_t on_in(Cpu *c, uint32_t port, int bytes) {
     (void)bytes;
     switch (port) {
     case 0x3DA: {                                  /* input status: retrace on a real 70 Hz clock */
-        /* The game paces its frame loop (and with it the frame-counted
-         * scroll delays) by waiting for vertical retrace.  Bit 3 is set for
-         * the first tenth of each 1/70 s, like a VGA in mode 13h; bit 0
+        /* The game paces its frames and palette fades by waiting for
+         * vertical retrace.  Bit 3 is set for the first tenth of each 1/70 s,
+         * like a VGA in mode 13h, and for at least one read in every period:
+         * a poll that took longer than the retrace itself (a slow frame)
+         * still sees it, so a wait never runs into the next period.  Bit 0
          * (display disabled) also flips on every read for horizontal waits. */
         pump(c);
-        uint64_t phase = (now_ns() - H.start_ns) % (1000000000ull / 70);
+        uint64_t t = now_ns() - H.start_ns, period = t / (1000000000ull / 70);
+        int in = t % (1000000000ull / 70) < 1000000000ull / 700;
+        if (period != H.retrace_period) { H.retrace_period = period; H.retrace_seen = 0; }
+        if (!H.retrace_seen) in = 1;
+        if (in) H.retrace_seen = 1;
         H.retrace ^= 0x01;
-        return (H.retrace & 0x01) | (phase < 1000000000ull / 700 ? 0x09 : 0);
+        return (H.retrace & 0x01) | (in ? 0x09 : 0);
     }
     case 0x3C9: {
         uint8_t v = H.dac[(H.dac_r * 3 + H.dac_rc) % 768];
@@ -1474,6 +1534,17 @@ static void build_psp_env(uint8_t *mem) {
     psp[0x81] = '\r';
 }
 
+static uint32_t G_ENTRY;
+static int run_game(Cpu *cp);
+
+#ifndef __EMSCRIPTEN__
+static void *game_thread(void *arg) {
+    UI.exit_code = run_game(arg);
+    atomic_store(&UI.done, 1);
+    return NULL;
+}
+#endif
+
 int main(int argc, char *argv[]) {
     H.game_dir = argc > 1 ? argv[1] : "work/game";
     H.cd_dir = argc > 2 ? argv[2] : "work/cd";
@@ -1529,25 +1600,43 @@ int main(int argc, char *argv[]) {
         c.watch_hi = c.watch_lo + (*end == ',' ? (uint32_t)strtoul(end + 1, NULL, 16) : 1);
     }
 #endif
-    int why = setjmp(c.stop);
+    G_ENTRY = entry;
+#ifdef __EMSCRIPTEN__
+    return run_game(&c);
+#else
+    window_open();
+    pthread_t game;
+    static pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 64u << 20);      /* lifted code recurses as deep as the game does */
+    if (pthread_create(&game, &attr, game_thread, &c) != 0) { perror("pthread_create"); return 1; }
+    window_loop();
+    pthread_join(game, NULL);
+    return UI.exit_code;
+#endif
+}
+
+/* Runs the game until it exits or stops; the exit code (1 after a stop). */
+static int run_game(Cpu *cp) {
+    int why = setjmp(cp->stop);
     if (why == 0) {
-        dispatch(&c, entry, 0);
+        dispatch(cp, G_ENTRY, 0);
         fprintf(stderr, "worms: entry point returned\n");
         return 0;
     }
-    if (why == STOP_EXIT) return (int)c.fault_addr;
+    if (why == STOP_EXIT) return (int)cp->fault_addr;
     const char *names[] = {"ok", "memory fault", "budget", "divide error", "bad return", "trap", "exit"};
     fprintf(stderr, "worms: stopped (%s) at %x\n  eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n",
-            names[why], c.fault_addr, c.r[EAX], c.r[ECX], c.r[EDX], c.r[EBX], c.r[ESP], c.r[EBP], c.r[ESI], c.r[EDI]);
+            names[why], cp->fault_addr, cp->r[EAX], cp->r[ECX], cp->r[EDX], cp->r[EBX], cp->r[ESP], cp->r[EBP], cp->r[ESI], cp->r[EDI]);
     if (why == STOP_BADRET)
-        fprintf(stderr, "  call at %x expected return to %x, got %x\n", c.bad_call, c.bad_expect, c.ret_to);
+        fprintf(stderr, "  call at %x expected return to %x, got %x\n", cp->bad_call, cp->bad_expect, cp->ret_to);
     fprintf(stderr, "  stack at last call:");
-    for (int k = 0; k < 8 && c.r[ESP] + 4 * k + 4 <= MEM_SIZE; k++) fprintf(stderr, " %08x", rd32(&c, c.r[ESP] + 4 * k));
+    for (int k = 0; k < 8 && cp->r[ESP] + 4 * k + 4 <= MEM_SIZE; k++) fprintf(stderr, " %08x", rd32(cp, cp->r[ESP] + 4 * k));
     fprintf(stderr, "\n");
 #ifdef RECOMP_TRACE
-    print_stack(&c);
+    print_stack(cp);
     fprintf(stderr, "  recently entered:");
-    for (uint32_t k = 0; k < 24 && k < c.trail_pos; k++) fprintf(stderr, " %x", c.trail[(c.trail_pos - 1 - k) & 63]);
+    for (uint32_t k = 0; k < 24 && k < cp->trail_pos; k++) fprintf(stderr, " %x", cp->trail[(cp->trail_pos - 1 - k) & 63]);
     fprintf(stderr, "\n");
 #endif
     return 1;

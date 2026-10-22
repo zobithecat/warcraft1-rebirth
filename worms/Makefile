@@ -1,6 +1,7 @@
 # Worms (DOS, 1995) recompiled: same lifter and CPU core as ../recomp.
 #   make            native build (build/worms)
 #   make run        run it (C: = work/game, D: = work/cd)
+#   make wasm       browser build (build/web), make serve to try it on localhost
 # work/ comes from tools/extract.py (your own CD image).
 PYTHON  ?= python3
 CC      ?= clang
@@ -17,7 +18,7 @@ BASES   := 1=0x10000,2=0x110000
 GAME_C  := build/game.c
 IMAGE   := build/image.bin
 
-.PHONY: all run clean
+.PHONY: all run clean wasm serve
 
 all: build/worms
 
@@ -38,5 +39,39 @@ build/worms: runtime/host.c $(RECOMP)/runtime/x86.h build/game.o $(IMAGE)
 run: build/worms
 	build/worms work/game work/cd $(IMAGE)
 
+# ---- browser: the same runtime under Emscripten in a Web Worker (see ../recomp) ----
+# The page, worker and audio worklet follow ../recomp/web; the CD's FMV folder
+# (82MB, the player is not run) stays out of the package.
+EMCC       ?= emcc
+WEB_CFLAGS ?= -O2 -Wall -Wextra -Wno-unused-parameter -DX86_HAVE_MMIO
+WEB_LDFLAGS := -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=96MB -sSTACK_SIZE=8MB -sEXIT_RUNTIME=1 \
+               --pre-js $(RECOMP)/web/env.js
+WEB_DATA   := --preload-file work/game@/game --preload-file work/cd/DATA@/cd/DATA \
+              --preload-file work/cd/WORMS.CFG@/cd/WORMS.CFG --preload-file work/audio.json@/work/audio.json \
+              --preload-file $(IMAGE)@/image.bin
+WEB_FILES  := build/web/index.html build/web/worker.js build/web/audio.js
+
+build/web/game.o: $(GAME_C) $(RECOMP)/runtime/x86.h
+	@mkdir -p build/web
+	$(EMCC) $(WEB_CFLAGS) -I$(RECOMP)/runtime -c $(GAME_C) -o $@
+
+build/web/worms.js: runtime/host.c $(RECOMP)/runtime/x86.h $(RECOMP)/web/env.js build/web/game.o $(IMAGE) work/audio.json
+	$(EMCC) $(WEB_CFLAGS) -I$(RECOMP)/runtime runtime/host.c build/web/game.o $(WEB_LDFLAGS) -sENVIRONMENT=worker \
+	  $(WEB_DATA) -o $@
+
+build/web/%: web/%
+	@mkdir -p build/web
+	cp $< $@
+
+build/web/audio.js: $(RECOMP)/web/audio.js
+	@mkdir -p build/web
+	cp $< $@
+
+wasm: build/web/worms.js $(WEB_FILES)
+
+serve: wasm
+	$(PYTHON) $(RECOMP)/tools/serve.py build/web --port 8017
+
 clean:
 	rm -f build/game.o build/worms
+	rm -rf build/web

@@ -9,13 +9,19 @@
 python3 tools/extract.py /path/to/CDWORMS.cue   # work/cd(D:), work/game(C:), work/audio.json (.bin은 .cue 옆)
 make                                           # build/game.c, build/image.bin, build/worms
 make run
+make serve                                     # 브라우저 빌드(build/web)를 http://localhost:8017 에서
 ```
+
+브라우저 빌드는 WarCraft와 같은 구조입니다: 게임은 Web Worker에서 돌고, 화면은 postMessage로, 입력은
+SharedArrayBuffer 링으로 오갑니다(COOP/COEP 헤더가 필요해서 `serve.py`로 띄움). 패키지는 약 12MB
+(wasm 4.8MB + 데이터 7.3MB)이고, 쓰지 않는 CD의 FMV 폴더(82MB)는 넣지 않습니다.
 
 ## 지금 되는 것 / 안 되는 것
 
 - 부팅 → 메인 메뉴 → 팀 선택 → 지형 생성 → 대전(이동, 조준, 발사, 폭발, 지형 파괴)까지 돕니다.
 - 마우스는 창 안의 포인터 위치로 게임 커서를 맞춥니다(게임은 매 프레임 드라이버 위치를 가운데로 되돌리는 상대 입력을 씀).
-- 아직 없음: 소리(Sound Blaster 효과음, CD 오디오 음악은 무음), 오프닝 FMV(외부 플레이어 실행은 건너뜀), 브라우저 빌드.
+- 네이티브와 브라우저 모두 같은 흐름을 확인했습니다(메뉴 → 대전 → 발사).
+- 아직 없음: 소리(Sound Blaster 효과음, CD 오디오 음악은 무음), 오프닝 FMV(외부 플레이어 실행은 건너뜀).
 
 ## WarCraft와 다른 점
 
@@ -28,12 +34,14 @@ make run
 | 타이머 | PIT를 ~72Hz로 설정하고 IRQ0 핸들러로 진행. 루프 안에서도 돌도록 분기 예산이 다 되면(`Hooks.budget`) 별도 스택에서 핸들러 실행 |
 | CD | D:는 데이터 트랙 폴더. MSCDEX(DPMI 0300h → int 2Fh 1510h) 요청에 오디오 트랙 표·재생 위치를 답함 |
 | 드라이브 | `WORMS.EXE`가 CD에서 `WRMS.EXE`를 띄우므로 현재 드라이브는 D: |
+| 창 | 게임은 별도 스레드, 창(SDL)은 메인 스레드. 창이 가려지면 Metal의 present가 drawable을 기다리며 막히는데, 게임 스레드에서 present하면 페이드의 귀선 대기가 매번 놓쳐 부팅이 30초 넘게 걸렸음 |
+| 귀선 | 3DAh 비트 3은 1/70초 주기마다 적어도 한 번은 보이게 함: 느린 폴링도 그 주기 안에 대기가 끝남 |
 
 ## 자동 실행
 
 ```bash
-# 메뉴에서 PLAY GAME → 팀 둘 선택 → START, 대전 중 발사
-WAR_MUTE=1 WAR_INPUT="36:click@160,64,39:hold@24,44,400,41:hold@24,52,400,43:rclick@24,60,45:click@205,154,97:keyhold@space,700,99:snap,100:quit" build/worms
+# 메뉴에서 PLAY GAME → 팀 선택 → START, 대전 중 발사 (메뉴는 ~12초, 대전은 ~40초에 시작)
+WAR_MUTE=1 WAR_INPUT="13:click@160,64,16:hold@24,44,400,18:hold@24,52,400,20:rclick@24,60,22:click@205,154,44:keyhold@space,700,46:snap,47:quit" build/worms
 ```
 
 WarCraft 런타임의 스크립트 명령(`click@`, `hold@`, `snap`, `dump`, ...)에 `keyhold@키,ms`가 더해졌습니다.
