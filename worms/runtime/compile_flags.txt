@@ -1,0 +1,3 @@
+-I../../recomp/runtime
+-I/opt/homebrew/include/SDL2
+-DX86_HAVE_MMIO

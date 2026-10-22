@@ -3,6 +3,8 @@
 WarCraft: Orcs & Humans(DOS, 1994, v1.12)의 실행 파일을 x86 기계어에서 C로 정적 재컴파일해
 맥 arm64 네이티브와 WebAssembly로 돌려 보는 **개인 연구·실험 프로젝트**입니다.
 변환기, 런타임(DOS/DPMI/VGA/입력/사운드 대체), 검증 도구가 들어 있습니다. 자세한 내용은 [recomp/README.md](recomp/README.md).
+같은 변환기로 Worms(DOS, 1995, Team17)도 옮기는 중입니다: [worms/README.md](worms/README.md).
+Worms의 이름과 게임 코드·데이터는 Team17의 것이고, 이 프로젝트는 Team17과 관계가 없습니다.
 
 > **이 저장소에는 게임이 들어 있지 않습니다.** 게임 실행 파일, 데이터, 그리고 그것에서 만들어지는 결과물은
 > 포함하지 않고, 구할 곳도 안내하지 않습니다. 돌려 보려면 직접 정당하게 가진 원본이 필요합니다.

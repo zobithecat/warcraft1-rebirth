@@ -6,10 +6,13 @@
 !/LICENSE
 !/README.md
 !/recomp/
+!/worms/
 
 # Generated from the game files / by the build; never commit.
 /recomp/work/
 /recomp/build/
+/worms/work/
+/worms/build/
 
 __pycache__/
 .DS_Store
