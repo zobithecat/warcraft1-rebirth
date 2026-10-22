@@ -7,6 +7,12 @@
 # stops the push.  The deploy is built from the working tree, so it refuses
 # to run unless that tree is exactly the commit being pushed.
 [ -n "$SKIP_DEPLOY" ] && exit 0
+# The lifter needs capstone: take the first python3 that has it, starting with
+# the pusher's own, before the Homebrew directories go in front of PATH.
+PYTHON=python3
+for p in "$(command -v python3)" /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    if [ -x "$p" ] && "$p" -c "import capstone" 2>/dev/null; then PYTHON=$p; break; fi
+done
 PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"    # emcc, aws: also when pushing from a GUI
 
 pushed=""
@@ -30,7 +36,7 @@ if [ -n "$(git -C "$root" status --porcelain --untracked-files=no -- recomp)" ];
 fi
 
 echo "pre-push: deploying the browser build (make deploy)..."
-if ! make -C "$root/recomp" deploy; then
+if ! make -C "$root/recomp" deploy PYTHON="$PYTHON"; then
     echo "pre-push: deploy failed; push stopped (SKIP_DEPLOY=1 git push to push anyway)." >&2
     exit 1
 fi
