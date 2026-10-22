@@ -465,6 +465,79 @@ static void track_drag(Cpu *c, int button, int down) {
     }
 }
 
+/* ---- speeds -----------------------------------------------------------------------
+ * Game speed: the game paces its ticks by clock() (INT 21h/2Ch), so the
+ * runtime hands it a clock that runs `game_speed` times as fast as real time.
+ * Frames: on the map the game loops as fast as the CPU allows (about 20,000
+ * times a second here; a 486 managed a few dozen), and it counts scroll
+ * delays in loops.  The map loop is held to FRAME_HZ x game speed, enough
+ * for one tick per loop at the fastest in-game speed (100 ticks/s), and the
+ * game's scroll delay tables are rescaled to that rate and `scroll_speed`.
+ * Set from the page (input event type 4) or WAR_GAME_SPEED / WAR_SCROLL_SPEED
+ * / WAR_WASD. */
+#define FRAME_HZ      120.0
+#define BASE_HZ       60.0         /* the frame rate the original delay values are taken to mean */
+#define G_SCROLL_TABS 0x53194u     /* u16[3][5]: mouse repeat, mouse first, key; by scroll setting */
+
+static double game_speed = 1.0, scroll_speed = 1.0;
+static int wasd = 1;
+static uint64_t game_clock, game_clock_real;   /* ns: game time, and the real time it was taken at */
+static uint16_t scroll_base[15];
+static int scroll_base_read;
+static double scroll_applied = -1;
+
+static uint64_t game_ns(void) {
+    uint64_t r = now_ns();
+    if (!game_clock_real) game_clock_real = r;
+    game_clock += (uint64_t)((double)(r - game_clock_real) * game_speed);
+    game_clock_real = r;
+    return game_clock;
+}
+
+static void apply_scroll_tables(Cpu *c, double fps) {
+    double k = fps / BASE_HZ / scroll_speed;
+    if (k == scroll_applied) return;
+    if (!scroll_base_read) {
+        for (int i = 0; i < 15; i++) scroll_base[i] = (uint16_t)rd16(c, G_SCROLL_TABS + 2u * (uint32_t)i);
+        scroll_base_read = 1;
+    }
+    for (int i = 0; i < 15; i++) {
+        double v = scroll_base[i] * k + 0.5;
+        wr16(c, G_SCROLL_TABS + 2u * (uint32_t)i, (uint32_t)(v < 1 ? 1 : v > 65535 ? 65535 : v));
+    }
+    scroll_applied = k;
+}
+
+static void idle_sleep(void);
+static void pump(Cpu *c);
+
+/* Once per map loop: wait for the next frame slot (keeping the window, sound
+ * and input alive meanwhile). */
+static void frame_pace(Cpu *c) {
+    static uint64_t next;
+    double fps = FRAME_HZ * (game_speed > 1 ? game_speed : 1);
+    uint64_t period = (uint64_t)(1e9 / fps), t = now_ns();
+    if (next < t - (t > period ? period : t)) next = t;             /* after a pause: no catching up */
+    while (t < next) { pump(c); idle_sleep(); t = now_ns(); }
+    next += period;
+    apply_scroll_tables(c, fps);
+}
+
+static void set_option(int id, double v) {
+    if (id == 1 && v >= 0.1 && v <= 20) { game_ns(); game_speed = v; }
+    else if (id == 2 && v >= 0.01 && v <= 20) scroll_speed = v;
+    else if (id == 3) wasd = v != 0;
+}
+
+/* WASD as arrow keys while playing a map (elsewhere they stay letters). */
+static uint8_t map_key(Cpu *c, uint8_t scan) {
+    static const uint8_t from[4] = { 0x11, 0x1E, 0x1F, 0x20 }, to[4] = { 0x48, 0x4B, 0x50, 0x4D };
+    if (!wasd || rd32(c, G_FRAME_HOOK) != 0x1A0F0) return scan;
+    for (int i = 0; i < 4; i++)
+        if ((scan & 0x7F) == from[i]) return (uint8_t)((scan & 0x80) | to[i]);
+    return scan;
+}
+
 static int on_wrap(Cpu *c, uint32_t func) {
     switch (func) {
     case 0x1B468:                                   /* right click on the map */
@@ -474,6 +547,9 @@ static int on_wrap(Cpu *c, uint32_t func) {
         return 1;
     case 0x1A2B0:                                   /* left button released */
         if (box.pending) { box.pending = 0; box_select(c); }
+        return 0;
+    case 0x1A0F0:                                   /* once per map loop */
+        frame_pace(c);
         return 0;
     }
     return 0;
@@ -497,7 +573,8 @@ static void mouse_input(Cpu *c, uint32_t fx, uint32_t fy, int button, int down) 
 
 /* Input from the window (or the page) in one form for both builds. */
 typedef struct {
-    int32_t type;          /* 1: key, a = PC scancode (| 0x80 released); 2: mouse; 3: quit */
+    int32_t type;          /* 1: key, a = PC scancode (| 0x80 released); 2: mouse; 3: quit;
+                              4: setting, a = id (1 game speed, 2 scroll speed, 3 WASD), b = value x 1000 */
     int32_t a, b, c;       /* mouse: a, b = position as in mouse_input, c = button | down << 3 */
 } InputEvent;
 
@@ -522,8 +599,9 @@ static void defer_input(InputEvent ev, uint64_t due) {
 }
 
 static void handle_input(Cpu *c, const InputEvent *ev, uint64_t now) {
-    if (ev->type == 1) key_event(c, (uint8_t)ev->a);
+    if (ev->type == 1) key_event(c, map_key(c, (uint8_t)ev->a));
     else if (ev->type == 3) x86_stop(c, STOP_EXIT, 0);
+    else if (ev->type == 4) set_option(ev->a, ev->b / 1000.0);     /* page setting: id, value x 1000 */
     else if (ev->type == 2) {
         int button = ev->c & 7, down = ev->c >> 3 & 1;
         if (button && down) pressed_at[button] = now;
@@ -636,6 +714,15 @@ static void run_script(Cpu *c, uint64_t now) {
             defer_input(ev, now + MIN_CLICK_MS);
             ev.c = button;
             defer_input(ev, now + 2 * MIN_CLICK_MS);
+        } else if (strncmp(w, "hold@", 5) == 0) {         /* hold@x,y,ms: left button down for ms */
+            int x = 0, y = 0, ms = 0;
+            sscanf(w + 5, "%d,%d,%d", &x, &y, &ms);
+            InputEvent ev = { 2, x * 65536 / 320, y * 65536 / 200, 0 };
+            defer_input(ev, now);
+            ev.c = 1 | 8;
+            defer_input(ev, now + MIN_CLICK_MS);
+            ev.c = 1;
+            defer_input(ev, now + MIN_CLICK_MS + (uint64_t)ms);
         } else if (strncmp(w, "move@", 5) == 0) {         /* move@x,y: pointer only */
             int x = 0, y = 0;
             sscanf(w + 5, "%d,%d", &x, &y);
@@ -756,6 +843,12 @@ EM_JS(void, web_audio, (const int16_t *pcm, int frames), {
 });
 static void audio_open(void) {}
 static void audio_out(const int16_t *pcm, int frames) { web_audio(pcm, frames); }
+/* Sleep the worker ~1 ms on the input ring's read counter, which only we change. */
+EM_JS(void, web_sleep, (int ms), {
+    const r = globalThis.warRing;
+    if (r) Atomics.wait(r, 1, Atomics.load(r, 1), ms);
+});
+static void idle_sleep(void) { web_sleep(1); }
 #else
 static SDL_AudioDeviceID audio_dev;
 
@@ -780,6 +873,13 @@ static void audio_out(const int16_t *pcm, int frames) {
     if (!audio_dev) return;
     if (SDL_GetQueuedAudioSize(audio_dev) > AUDIO_RATE * 4 / 4) return;   /* over 250 ms behind: drop */
     SDL_QueueAudio(audio_dev, pcm, (Uint32)frames * 4);
+}
+#endif
+
+#ifndef __EMSCRIPTEN__
+static void idle_sleep(void) {
+    struct timespec ts = { 0, 500000 };
+    nanosleep(&ts, NULL);
 }
 #endif
 
@@ -893,7 +993,7 @@ static void int21(Cpu *c, uint32_t at) {
     }
     case 0x2C: {                                   /* time: the game's clock() */
         pump(c);
-        uint64_t cs = (now_ns() - H.start_ns) / 10000000ull + 12ull * 360000;
+        uint64_t cs = game_ns() / 10000000ull + 12ull * 360000;   /* runs at the game speed */
         uint32_t day = (uint32_t)(cs % 8640000ull);
         set16(c, ECX, (day / 360000) << 8 | (day / 6000) % 60);
         set16(c, EDX, ((day / 100) % 60) << 8 | day % 100);
@@ -1135,10 +1235,16 @@ static void on_int(Cpu *c, int vec, uint32_t at) {
 static uint32_t on_in(Cpu *c, uint32_t port, int bytes) {
     (void)bytes;
     switch (port) {
-    case 0x3DA:                                    /* input status: alternate retrace */
+    case 0x3DA: {                                  /* input status: retrace on a real 70 Hz clock */
+        /* The game paces its frame loop (and with it the frame-counted
+         * scroll delays) by waiting for vertical retrace.  Bit 3 is set for
+         * the first tenth of each 1/70 s, like a VGA in mode 13h; bit 0
+         * (display disabled) also flips on every read for horizontal waits. */
         pump(c);
-        H.retrace ^= 0x09;
-        return H.retrace;
+        uint64_t phase = (now_ns() - H.start_ns) % (1000000000ull / 70);
+        H.retrace ^= 0x01;
+        return (H.retrace & 0x01) | (phase < 1000000000ull / 700 ? 0x09 : 0);
+    }
     case 0x3C9: {
         uint8_t v = H.dac[(H.dac_r * 3 + H.dac_rc) % 768];
         if (++H.dac_rc == 3) { H.dac_rc = 0; H.dac_r = (H.dac_r + 1) & 0xFF; }
@@ -1381,6 +1487,9 @@ int main(int argc, char *argv[]) {
     if (getenv("WAR_SNAPSHOT")) H.snapshot_ms = (uint64_t)(atof(getenv("WAR_SNAPSHOT")) * 1000);
     parse_script(getenv("WAR_INPUT"));
     H.start_ns = now_ns();
+    if (getenv("WAR_GAME_SPEED")) set_option(1, atof(getenv("WAR_GAME_SPEED")));
+    if (getenv("WAR_SCROLL_SPEED")) set_option(2, atof(getenv("WAR_SCROLL_SPEED")));
+    if (getenv("WAR_WASD")) set_option(3, atof(getenv("WAR_WASD")));
     snd_init(AUDIO_RATE, H.game_dir);
     audio_open();
     if (getenv("WAR_WAV") && (wav_out = fopen(getenv("WAR_WAV"), "wb"))) {

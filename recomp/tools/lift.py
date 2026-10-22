@@ -120,7 +120,8 @@ HLE.update({
 # first (x86_wrap; nonzero means it handled the call, `ret` included) and
 # otherwise runs the original code, lifted as f_<addr>_orig.  Used for the
 # modern controls in runtime/game.c, which run where the game handles input.
-WRAP = {0x1B468: "right click on the map", 0x1A2B0: "left button released"}
+WRAP = {0x1B468: "right click on the map", 0x1A2B0: "left button released",
+        0x1A0F0: "per-frame input on the map"}
 
 
 @dataclass

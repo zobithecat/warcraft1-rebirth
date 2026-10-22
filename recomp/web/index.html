@@ -11,6 +11,11 @@
   canvas { width: min(960px, calc(100vw - 32px)); aspect-ratio: 320 / 200; image-rendering: pixelated;
            background: #000; cursor: none; outline: none; }
   #status { color: var(--dim); min-height: 1.4em; }
+  #controls { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: center; justify-content: center;
+              width: min(960px, calc(100vw - 32px)); }
+  #controls label { display: flex; align-items: center; gap: 8px; }
+  #controls input[type=range] { width: 140px; accent-color: #c9a227; }
+  #controls output { min-width: 4.5em; color: var(--fg); }
   #log { width: min(960px, calc(100vw - 32px)); max-height: 8em; overflow: auto; margin: 0; color: var(--dim);
          white-space: pre-wrap; }
 </style>
@@ -18,6 +23,11 @@
 <body>
 <main>
   <canvas id="screen" width="320" height="200" tabindex="0"></canvas>
+  <div id="controls">
+    <label>게임 속도 <input type="range" id="game-speed" min="0.25" max="5" step="0.25" value="1"><output id="game-speed-out"></output></label>
+    <label>스크롤 속도 <input type="range" id="scroll-speed" min="0.1" max="2" step="0.05" value="1"><output id="scroll-speed-out"></output></label>
+    <label><input type="checkbox" id="wasd" checked> WASD 스크롤</label>
+  </div>
   <div id="status">loading…</div>
   <pre id="log"></pre>
 </main>
@@ -103,6 +113,31 @@ canvas.addEventListener("mousemove", (e) => mouse(e, 0, false));
 canvas.addEventListener("mousedown", (e) => { canvas.focus(); mouse(e, BUTTON[e.button] || 0, true); });
 canvas.addEventListener("mouseup", (e) => mouse(e, BUTTON[e.button] || 0, false));
 canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// Speeds and WASD (runtime/game.c "speeds"): sent as input events of type 4, value x 1000.
+const SETTINGS = [
+  { id: 1, el: document.getElementById("game-speed"), out: document.getElementById("game-speed-out") },
+  { id: 2, el: document.getElementById("scroll-speed"), out: document.getElementById("scroll-speed-out") },
+  { id: 3, el: document.getElementById("wasd") },
+];
+function applySetting(s, save) {
+  const v = s.el.type === "checkbox" ? (s.el.checked ? 1 : 0) : Number(s.el.value);
+  if (s.out) s.out.textContent = "×" + v.toFixed(2);
+  send(4, s.id, Math.round(v * 1000), 0);
+  if (save) try { localStorage.setItem("war-setting-" + s.id, String(v)); } catch (_) {}
+}
+for (const s of SETTINGS) {
+  try {
+    const saved = localStorage.getItem("war-setting-" + s.id);
+    if (saved !== null) {
+      if (s.el.type === "checkbox") s.el.checked = saved !== "0";
+      else s.el.value = saved;
+    }
+  } catch (_) {}
+  applySetting(s, false);
+  s.el.addEventListener("input", () => applySetting(s, true));
+  s.el.addEventListener("change", () => canvas.focus());     // keys go back to the game
+}
 
 // ?input=... etc. become WAR_INPUT etc. (scripted runs, as with the native build)
 const env = {};
